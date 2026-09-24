@@ -1,0 +1,107 @@
+#!/bin/zsh
+# Builds WirePlay.app.
+#   ./build.sh             build for this Mac into ./build (signed with your local cert if present)
+#   ./build.sh --install   build, install to ~/Applications, and launch
+#   ./build.sh --release   build a universal (Apple silicon + Intel), ad-hoc-signed app and zip it into ./dist
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# OneDrive (and similar sync folders) keeps re-adding Finder metadata to files, which breaks the
+# code signature of anything we ship. Release builds therefore run in a temporary copy.
+if [[ "${1:-}" == "--release" && -z "${WIREPLAY_CLEAN_BUILD:-}" ]]; then
+  WORK=$(mktemp -d)
+  rsync -a --exclude build --exclude dist --exclude .git ./ "$WORK/src/"
+  WIREPLAY_CLEAN_BUILD=1 "$WORK/src/build.sh" --release
+  mkdir -p dist && cp "$WORK/src/dist/"*.zip dist/
+  rm -rf "$WORK"
+  echo "Copied to $PWD/dist/"
+  exit 0
+fi
+
+VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.plist)
+APP=build/WirePlay.app
+MODE="${1:-}"
+FRAMEWORKS=(-framework Cocoa -framework SwiftUI -framework ScreenCaptureKit -framework CoreMedia -framework ServiceManagement)
+FLAGS=(-O -swift-version 5)
+
+rm -rf build && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/PlugIns"
+
+# Xcode is needed for the Control Center button (an app extension). Use it without requiring
+# `sudo xcode-select`; without Xcode the app still builds, just without the button.
+if [[ -d /Applications/Xcode.app ]]; then export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer; fi
+
+if [[ "$MODE" == "--release" ]]; then
+  echo "Compiling universal binary (arm64 + x86_64)…"
+  swiftc "${FLAGS[@]}" -target arm64-apple-macos26.0  "${FRAMEWORKS[@]}" -o build/WirePlay-arm64  Sources/main.swift
+  swiftc "${FLAGS[@]}" -target x86_64-apple-macos26.0 "${FRAMEWORKS[@]}" -o build/WirePlay-x86_64 Sources/main.swift
+  lipo -create build/WirePlay-arm64 build/WirePlay-x86_64 -output "$APP/Contents/MacOS/WirePlay"
+  rm build/WirePlay-arm64 build/WirePlay-x86_64
+  ARCHS=(-arch arm64 -arch x86_64)
+else
+  echo "Compiling…"
+  swiftc "${FLAGS[@]}" -target arm64-apple-macos26.0 "${FRAMEWORKS[@]}" -o "$APP/Contents/MacOS/WirePlay" Sources/main.swift
+  ARCHS=(-arch arm64)
+fi
+cp Info.plist "$APP/Contents/Info.plist"
+
+echo "Rendering icon…"
+ICONSET=build/AppIcon.iconset
+mkdir -p "$ICONSET"
+"$APP/Contents/MacOS/WirePlay" --make-icon "$ICONSET"
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+rm -rf "$ICONSET"
+
+# Release builds are ad hoc (a personal certificate means nothing on other Macs). Local builds
+# reuse the local signing cert (made for AirToggle) so macOS keeps recognising the app, and its
+# Screen Recording / Accessibility permissions, across rebuilds.
+IDENTITY="-"
+if [[ "$MODE" != "--release" ]] && security find-identity -p codesigning 2>/dev/null | grep -q "AirToggle Local Signing"; then
+  IDENTITY="AirToggle Local Signing"
+fi
+
+if [[ -n "${DEVELOPER_DIR:-}" ]]; then
+  echo "Building Control Center button…"
+  xcodebuild -quiet -project WirePlayControls.xcodeproj -target WirePlayControls -configuration Release "${ARCHS[@]}" \
+    ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO SYMROOT="$PWD/build/xcode" OBJROOT="$PWD/build/xcode/obj" 2>&1 | grep -v "^$" || true
+  APPEX=build/xcode/Release/WirePlayControls.appex
+  [[ -d "$APPEX" ]] || { echo "Control Center button failed to build"; exit 1; }
+  cp -R "$APPEX" "$APP/Contents/PlugIns/"
+  xattr -cr "$APP" # OneDrive adds Finder metadata that code signing rejects
+  # Extensions must be sandboxed; sign the extension first, then the app around it.
+  codesign --force --sign "$IDENTITY" --identifier dev.ben.WirePlay.Controls \
+    --entitlements Controls/WirePlayControls.entitlements "$APP/Contents/PlugIns/WirePlayControls.appex"
+elif [[ "$MODE" == "--release" ]]; then
+  echo "A release needs Xcode (for the Control Center button)."; exit 1
+else
+  echo "Xcode not found: skipping the Control Center button."
+fi
+
+xattr -cr "$APP"
+codesign --force --sign "$IDENTITY" --identifier dev.ben.WirePlay "$APP"
+echo "Built $APP (version $VERSION)"
+
+if [[ "$MODE" == "--release" ]]; then
+  mkdir -p dist
+  ZIP="dist/WirePlay-$VERSION.zip"
+  rm -f "$ZIP"
+  ditto -c -k --norsrc --noextattr --keepParent "$APP" "$ZIP"
+  # Check the signature the way a tester will receive it: freshly unzipped.
+  CHECK=$(mktemp -d); ditto -x -k "$ZIP" "$CHECK"
+  codesign --verify --deep --strict "$CHECK/WirePlay.app" && echo "Signature verified on the unzipped app"
+  rm -rf "$CHECK"
+  echo "Release archive: $ZIP ($(du -h "$ZIP" | cut -f1))"
+  lipo -info "$APP/Contents/MacOS/WirePlay" "$APP/Contents/PlugIns/WirePlayControls.appex/Contents/MacOS/WirePlayControls"
+  exit 0
+fi
+
+if [[ "$MODE" == "--install" ]]; then
+  DEST="$HOME/Applications/WirePlay.app"
+  mkdir -p "$HOME/Applications"
+  pkill -f "WirePlay.app/Contents/MacOS" 2>/dev/null || true
+  rm -rf "$DEST" && cp -R "$APP" "$DEST"
+  # Register the app and its Control Center button with macOS.
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST"
+  pluginkit -a "$DEST/Contents/PlugIns/WirePlayControls.appex" 2>/dev/null || true
+  open "$DEST"
+  echo "Installed and launched $DEST — look for the monitor-and-plug icon in the menu bar."
+fi

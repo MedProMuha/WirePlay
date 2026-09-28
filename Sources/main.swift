@@ -3,12 +3,13 @@
 // When an external display is connected, WirePlay asks what to show on it:
 //   • Entire Screen    — macOS hardware mirroring of the built-in display.
 //   • Window or App    — the display is covered by a black WirePlay window and only the
-//                        windows / apps picked in the system content picker are drawn on it.
+//                        windows / apps picked in WirePlay's window grid are drawn on it.
 //   • Extended Display — a normal extended desktop.
 //
-// Window or App uses ScreenCaptureKit's SCContentSharingPicker, the same picker AirPlay and
-// video-call apps use, so windows can be added or removed later and no Screen Recording
-// permission is needed. While it shows windows, the pointer (and any stray window) is kept off
+// Window or App lists windows in WirePlay's own grid by default (WindowPickerModel), which needs
+// Screen Recording permission. Settings can switch to ScreenCaptureKit's SCContentSharingPicker,
+// the system picker AirPlay and video-call apps use, which needs no permission. Either way,
+// windows can be added or removed later. While it shows windows, the pointer (and any stray window) is kept off
 // that display so nothing gets lost behind the presentation.
 //
 // Each monitor is remembered with a rule: ask, one of the three modes, or ignore (leave it to macOS).

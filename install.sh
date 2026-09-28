@@ -18,15 +18,26 @@ URL=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
 if [[ -z "$URL" ]]; then echo "Could not find a release download. Visit https://github.com/$REPO/releases"; exit 1; fi
 
 TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
 echo "Downloading $(basename "$URL")…"
 curl -fsSL "$URL" -o "$TMP/WirePlay.zip"
 ditto -x -k "$TMP/WirePlay.zip" "$TMP/unpacked"
+NEW_APP="$TMP/unpacked/WirePlay.app"
+if [[ ! -d "$NEW_APP" ]]; then echo "The download didn't contain WirePlay.app. Visit https://github.com/$REPO/releases"; exit 1; fi
 
-echo "Installing to $DEST…"
+# Braces matter: macOS's Bash 3.2 reads the "…" after a bare $DEST as part of the variable name.
+echo "Installing to ${DEST}…"
 pkill -f "WirePlay.app/Contents/MacOS" 2>/dev/null || true
-rm -rf "$DEST"
-mv "$TMP/unpacked/WirePlay.app" "$DEST"
-rm -rf "$TMP"
+# Keep the current copy until the new one is in place, so a failed install doesn't leave nothing.
+BACKUP=""
+if [[ -e "$DEST" ]]; then
+  BACKUP="$TMP/previous-WirePlay.app"
+  mv "$DEST" "$BACKUP"
+fi
+if ! mv "$NEW_APP" "$DEST"; then
+  if [[ -n "$BACKUP" ]]; then mv "$BACKUP" "$DEST"; echo "Install failed. Your previous WirePlay was put back."; fi
+  exit 1
+fi
 
 # The app is open source and not notarized (that needs a paid Apple Developer account), so
 # macOS marks the download as quarantined and would refuse to open it. Clearing that flag is

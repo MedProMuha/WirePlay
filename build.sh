@@ -38,9 +38,11 @@ if [[ "$MODE" == "--release" ]]; then
   rm build/WirePlay-arm64 build/WirePlay-x86_64
   ARCHS=(-arch arm64 -arch x86_64)
 else
-  echo "Compiling…"
-  swiftc "${FLAGS[@]}" -target arm64-apple-macos26.0 "${FRAMEWORKS[@]}" -o "$APP/Contents/MacOS/WirePlay" Sources/main.swift
-  ARCHS=(-arch arm64)
+  # Build for this Mac's own architecture (arm64 on Apple silicon, x86_64 on Intel).
+  LOCAL_ARCH=$(uname -m)
+  echo "Compiling ($LOCAL_ARCH)…"
+  swiftc "${FLAGS[@]}" -target "$LOCAL_ARCH-apple-macos26.0" "${FRAMEWORKS[@]}" -o "$APP/Contents/MacOS/WirePlay" Sources/main.swift
+  ARCHS=(-arch "$LOCAL_ARCH")
 fi
 cp Info.plist "$APP/Contents/Info.plist"
 
@@ -87,7 +89,9 @@ if [[ "$MODE" == "--release" ]]; then
   ditto -c -k --norsrc --noextattr --keepParent "$APP" "$ZIP"
   # Check the signature the way a tester will receive it: freshly unzipped.
   CHECK=$(mktemp -d); ditto -x -k "$ZIP" "$CHECK"
-  codesign --verify --deep --strict "$CHECK/WirePlay.app" && echo "Signature verified on the unzipped app"
+  # On its own line so a failed check stops the script (set -e ignores a failure left of &&).
+  codesign --verify --deep --strict "$CHECK/WirePlay.app"
+  echo "Signature verified on the unzipped app"
   rm -rf "$CHECK"
   echo "Release archive: $ZIP ($(du -h "$ZIP" | cut -f1))"
   lipo -info "$APP/Contents/MacOS/WirePlay" "$APP/Contents/PlugIns/WirePlayControls.appex/Contents/MacOS/WirePlayControls"

@@ -13,14 +13,24 @@ fi
 
 echo "Looking up the latest WirePlay release…"
 # Releases are published as regular releases (with "beta" in the tag) so this endpoint is deterministic.
-URL=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-      | grep -o '"browser_download_url": *"[^"]*\.zip"' | head -1 | sed 's/.*"\(http[^"]*\)"/\1/')
+RELEASE=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest")
+URL=$(echo "$RELEASE" | grep -o '"browser_download_url": *"[^"]*\.zip"' | head -1 | sed 's/.*"\(http[^"]*\)"/\1/' || true)
+SUM_URL=$(echo "$RELEASE" | grep -o '"browser_download_url": *"[^"]*\.zip\.sha256"' | head -1 | sed 's/.*"\(http[^"]*\)"/\1/' || true)
 if [[ -z "$URL" ]]; then echo "Could not find a release download. Visit https://github.com/$REPO/releases"; exit 1; fi
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 echo "Downloading $(basename "$URL")…"
 curl -fsSL "$URL" -o "$TMP/WirePlay.zip"
+# Each release publishes a SHA-256 of its zip; refuse a download that doesn't match it.
+if [[ -n "$SUM_URL" ]]; then
+  EXPECTED=$(curl -fsSL "$SUM_URL" | awk '{print $1}')
+  ACTUAL=$(shasum -a 256 "$TMP/WirePlay.zip" | awk '{print $1}')
+  if [[ -z "$EXPECTED" || "$EXPECTED" != "$ACTUAL" ]]; then
+    echo "The download's checksum doesn't match the release, so it wasn't installed. Please try again."; exit 1
+  fi
+  echo "Checksum verified."
+fi
 ditto -x -k "$TMP/WirePlay.zip" "$TMP/unpacked"
 NEW_APP="$TMP/unpacked/WirePlay.app"
 if [[ ! -d "$NEW_APP" ]]; then echo "The download didn't contain WirePlay.app. Visit https://github.com/$REPO/releases"; exit 1; fi

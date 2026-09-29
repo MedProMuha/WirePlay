@@ -12,7 +12,7 @@ A small menu bar app for macOS 26 or later, on Apple silicon or Intel Macs.
 curl -fsSL https://raw.githubusercontent.com/ben-medpro/WirePlay/main/install.sh | bash
 ```
 
-This downloads the latest release into `/Applications`, clears the download quarantine (the app isn't notarized) and opens it. You can also download the zip from [Releases](https://github.com/ben-medpro/WirePlay/releases), move `WirePlay.app` to Applications, then right-click it and choose **Open** the first time.
+This downloads the latest release, checks it against the release's published SHA-256 checksum, installs it into `/Applications` (your previous copy is kept until the new one is in place), clears the download quarantine (the app isn't notarized) and opens it. You can also download the zip from [Releases](https://github.com/ben-medpro/WirePlay/releases), move `WirePlay.app` to Applications, then right-click it and choose **Open** the first time.
 
 ## How it works
 
@@ -28,6 +28,7 @@ While you're showing windows:
 
 - **Your pointer stays on your Mac.** It can't wander onto the TV, and you can't drag a window across by accident.
 - **The TV only shows your pointer when it's over a shared window.** It's hidden everywhere else.
+- **A brief disconnect doesn't end it.** If the cable blips or the TV switches inputs, WirePlay keeps going for 15 seconds and resumes when the same monitor comes back.
 - **Stray windows come back.** Any window that ends up on the TV is moved back to your Mac. This needs Accessibility permission, which you grant from Settings.
 - **Add or remove windows at any time** from the menu bar icon or the Control Center button. **Blank Screen** hides everything for a moment.
 
@@ -54,15 +55,20 @@ Mirroring and Extended Display need no permissions. If you'd rather not grant Sc
 
 ## Known limits (beta)
 
+- **Window or App needs your Mac's own screen.** With the lid closed and only the TV attached, that option is greyed out; use Entire Screen, or open the lid.
+- **Several displays at once:** WirePlay asks about each one in turn, but shows windows on only one display at a time.
+
 - The app is ad hoc signed, not notarized. After an update, macOS may ask you to allow Screen Recording or Accessibility again.
 - If an app floats invisible windows over others (Grammarly does), WirePlay leaves those apps out of the window list automatically.
-- Troubleshooting log: `~/Library/Logs/WirePlay.log`.
+- **Monitors without a serial number:** some monitors don't report one, so every monitor of that model shares one name and rule. Settings marks these.
+- **Which version am I running?** The version and the git commit it was built from are at the bottom of the menu bar menu, and in the first line of the log.
+- Troubleshooting log: `~/Library/Logs/WirePlay.log` (it rolls over at 1 MB).
 
 ## Build from source
 
 ```bash
-./build.sh --install    # build for this Mac, install to ~/Applications and launch
-./build.sh --release    # universal, ad-hoc-signed zip in ./dist
+./build.sh --install    # build for this Mac, install to /Applications and launch
+./build.sh --release    # universal, ad-hoc-signed zip + .sha256 in ./dist
 ```
 
 The app is a single Swift file (`Sources/main.swift`) built with `swiftc`. The Control Center button is a small WidgetKit extension (`Controls/`, `WirePlayControls.xcodeproj`), so building it needs Xcode in `/Applications`. Without Xcode, the app builds without the button.

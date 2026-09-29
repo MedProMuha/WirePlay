@@ -1,24 +1,33 @@
 #!/bin/zsh
 # Builds WirePlay.app.
 #   ./build.sh             build for this Mac into ./build (signed with your local cert if present)
-#   ./build.sh --install   build, install to ~/Applications, and launch
+#   ./build.sh --install   build, install to /Applications, and launch
 #   ./build.sh --release   build a universal (Apple silicon + Intel), ad-hoc-signed app and zip it into ./dist
 set -euo pipefail
 cd "$(dirname "$0")"
 
 # OneDrive (and similar sync folders) keeps re-adding Finder metadata to files, which breaks the
 # code signature of anything we ship. Release builds therefore run in a temporary copy.
+# The git commit is stamped into the app (Info.plist WirePlayCommit), so you can tell exactly
+# which source a copy was built from. "-dirty" means there were uncommitted changes.
+if [[ -z "${WIREPLAY_COMMIT:-}" ]]; then
+  WIREPLAY_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+  git diff --quiet HEAD -- 2>/dev/null || WIREPLAY_COMMIT="$WIREPLAY_COMMIT-dirty"
+  export WIREPLAY_COMMIT
+fi
+
 if [[ "${1:-}" == "--release" && -z "${WIREPLAY_CLEAN_BUILD:-}" ]]; then
   WORK=$(mktemp -d)
   rsync -a --exclude build --exclude dist --exclude .git ./ "$WORK/src/"
   WIREPLAY_CLEAN_BUILD=1 "$WORK/src/build.sh" --release
-  mkdir -p dist && cp "$WORK/src/dist/"*.zip dist/
+  mkdir -p dist && cp "$WORK/src/dist/"*.zip "$WORK/src/dist/"*.sha256 dist/
   rm -rf "$WORK"
   echo "Copied to $PWD/dist/"
   exit 0
 fi
 
 VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.plist)
+BUILD_NUMBER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" Info.plist)
 APP=build/WirePlay.app
 MODE="${1:-}"
 FRAMEWORKS=(-framework Cocoa -framework SwiftUI -framework ScreenCaptureKit -framework CoreMedia -framework ServiceManagement)
@@ -45,6 +54,7 @@ else
   ARCHS=(-arch "$LOCAL_ARCH")
 fi
 cp Info.plist "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :WirePlayCommit string $WIREPLAY_COMMIT" "$APP/Contents/Info.plist"
 
 echo "Rendering icon…"
 ICONSET=build/AppIcon.iconset
@@ -68,6 +78,10 @@ if [[ -n "${DEVELOPER_DIR:-}" ]]; then
   APPEX=build/xcode/Release/WirePlayControls.appex
   [[ -d "$APPEX" ]] || { echo "Control Center button failed to build"; exit 1; }
   cp -R "$APPEX" "$APP/Contents/PlugIns/"
+  # The button always carries the app's version. Its build number must keep going up, or
+  # Control Center keeps showing a cached copy of the old button.
+  APPEX_PLIST="$APP/Contents/PlugIns/WirePlayControls.appex/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" -c "Set :CFBundleVersion $BUILD_NUMBER" "$APPEX_PLIST"
   xattr -cr "$APP" # OneDrive adds Finder metadata that code signing rejects
   # Extensions must be sandboxed; sign the extension first, then the app around it.
   codesign --force --sign "$IDENTITY" --identifier dev.ben.WirePlay.Controls \
@@ -80,7 +94,7 @@ fi
 
 xattr -cr "$APP"
 codesign --force --sign "$IDENTITY" --identifier dev.ben.WirePlay "$APP"
-echo "Built $APP (version $VERSION)"
+echo "Built $APP (version $VERSION, build $BUILD_NUMBER, commit $WIREPLAY_COMMIT)"
 
 if [[ "$MODE" == "--release" ]]; then
   mkdir -p dist
@@ -93,18 +107,28 @@ if [[ "$MODE" == "--release" ]]; then
   codesign --verify --deep --strict "$CHECK/WirePlay.app"
   echo "Signature verified on the unzipped app"
   rm -rf "$CHECK"
-  echo "Release archive: $ZIP ($(du -h "$ZIP" | cut -f1))"
+  # Published next to the zip; install.sh refuses a download that doesn't match.
+  (cd dist && shasum -a 256 "$(basename "$ZIP")" > "$(basename "$ZIP").sha256")
+  echo "Release archive: $ZIP ($(du -h "$ZIP" | cut -f1)), SHA-256 $(cut -d' ' -f1 "$ZIP.sha256")"
   lipo -info "$APP/Contents/MacOS/WirePlay" "$APP/Contents/PlugIns/WirePlayControls.appex/Contents/MacOS/WirePlayControls"
   exit 0
 fi
 
 if [[ "$MODE" == "--install" ]]; then
-  DEST="$HOME/Applications/WirePlay.app"
-  mkdir -p "$HOME/Applications"
+  # Same place install.sh uses, so there is only ever one copy (and one Control Center button).
+  DEST="/Applications/WirePlay.app"
+  LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
   pkill -f "WirePlay.app/Contents/MacOS" 2>/dev/null || true
+  OLD="$HOME/Applications/WirePlay.app" # where earlier builds were installed
+  if [[ -d "$OLD" ]]; then
+    pluginkit -r "$OLD/Contents/PlugIns/WirePlayControls.appex" 2>/dev/null || true
+    "$LSREGISTER" -u "$OLD" 2>/dev/null || true
+    rm -rf "$OLD"
+    echo "Removed the older copy in ~/Applications."
+  fi
   rm -rf "$DEST" && cp -R "$APP" "$DEST"
   # Register the app and its Control Center button with macOS.
-  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST"
+  "$LSREGISTER" -f "$DEST"
   pluginkit -a "$DEST/Contents/PlugIns/WirePlayControls.appex" 2>/dev/null || true
   open "$DEST"
   echo "Installed and launched $DEST — look for the monitor-and-plug icon in the menu bar."

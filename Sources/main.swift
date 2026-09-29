@@ -25,15 +25,33 @@ import SwiftUI
 
 let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/WirePlay.log")
 
+private let logQueue = DispatchQueue(label: "WirePlay.log")
+private let logTimestamp = ISO8601DateFormatter() // only used on logQueue
+
 func log(_ message: String) {
-    let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
-    guard let data = line.data(using: .utf8) else { return }
-    if let handle = try? FileHandle(forWritingTo: logURL) {
-        handle.seekToEndOfFile(); handle.write(data); try? handle.close()
-    } else {
-        try? data.write(to: logURL)
+    let date = Date()
+    logQueue.async {
+        guard let data = "\(logTimestamp.string(from: date)) \(message)\n".data(using: .utf8) else { return }
+        // Keep it small: past 1 MB the log moves to WirePlay.log.1 and a new one starts.
+        if let size = (try? FileManager.default.attributesOfItem(atPath: logURL.path))?[.size] as? Int, size > 1_000_000 {
+            let old = logURL.appendingPathExtension("1")
+            try? FileManager.default.removeItem(at: old)
+            try? FileManager.default.moveItem(at: logURL, to: old)
+        }
+        if let handle = try? FileHandle(forWritingTo: logURL) {
+            handle.seekToEndOfFile(); handle.write(data); try? handle.close()
+        } else {
+            try? data.write(to: logURL)
+        }
     }
 }
+
+/// "1.0.0-beta.2 (d8670a7)": version plus the git commit the app was built from.
+let appVersion: String = {
+    let info = Bundle.main.infoDictionary ?? [:]
+    let version = info["CFBundleShortVersionString"] as? String ?? "?"
+    return info["WirePlayCommit"].map { "\(version) (\($0))" } ?? version
+}()
 
 // MARK: - Model
 
@@ -89,7 +107,7 @@ enum Rule: String, CaseIterable, Identifiable {
 // MARK: - Monitor memory and preferences
 
 final class Store: ObservableObject {
-    static let shared = Store()
+    nonisolated(unsafe) static let shared = Store() // main-thread only
 
     struct Monitor: Codable, Identifiable {
         var key: String
@@ -226,6 +244,7 @@ enum WindowRescue {
         }
         for pid in pids {
             let app = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(app, 0.5) // an unresponsive app mustn't stall us
             var value: CFTypeRef?
             guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
                   let windows = value as? [AXUIElement] else { continue }
@@ -260,6 +279,9 @@ struct ExternalDisplay: Equatable {
 
     /// Stable across reconnects (display IDs are not), used for "Set as Default".
     var key: String { "\(CGDisplayVendorNumber(id))-\(CGDisplayModelNumber(id))-\(CGDisplaySerialNumber(id))" }
+
+    /// Some monitors report serial number 0, so every unit of that model shares one key (and rule).
+    static func keyHasNoSerial(_ key: String) -> Bool { key.hasSuffix("-0") }
     var screen: NSScreen? { NSScreen.screens.first { $0.displayID == id } }
     var isMirrored: Bool { CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay }
 
@@ -322,10 +344,15 @@ final class ChooserModel: ObservableObject {
     @Published var setAsDefault = false
     let displayName: String
     let showingWindows: Bool   // already presenting windows on this display
+    let windowModeAvailable: Bool // false when this display is the Mac's only screen (lid closed)
     var onDone: (ChooserResult) -> Void = { _ in }
-    init(displayName: String, initial: ShowMode, showingWindows: Bool = false) {
-        self.displayName = displayName; self.mode = initial; self.showingWindows = showingWindows
+    init(displayName: String, initial: ShowMode, showingWindows: Bool = false, windowModeAvailable: Bool = true) {
+        self.displayName = displayName; self.showingWindows = showingWindows
+        self.windowModeAvailable = windowModeAvailable
+        self.mode = (initial == .windowOrApp && !windowModeAvailable) ? .entireScreen : initial
     }
+
+    func isAvailable(_ mode: ShowMode) -> Bool { mode != .windowOrApp || windowModeAvailable }
 
     var buttonTitle: String {
         showingWindows && mode == .windowOrApp ? "Add or Remove Windows" : mode.buttonTitle
@@ -344,14 +371,22 @@ struct ChooserView: View {
             HStack(spacing: 18) {
                 ForEach(ShowMode.allCases) { mode in
                     ModeCard(mode: mode, selected: model.mode == mode)
-                        .onTapGesture(count: 2) { model.mode = mode; model.onDone(.show(mode, remember: model.setAsDefault)) }
-                        .onTapGesture { model.mode = mode }
+                        .opacity(model.isAvailable(mode) ? 1 : 0.35)
+                        .onTapGesture(count: 2) {
+                            guard model.isAvailable(mode) else { return }
+                            model.mode = mode; model.onDone(.show(mode, remember: model.setAsDefault))
+                        }
+                        .onTapGesture { if model.isAvailable(mode) { model.mode = mode } }
+                        .help(model.isAvailable(mode) ? "" : "Needs your Mac’s own screen. Open the lid (or connect another display) to show just a window.")
                 }
             }
             .padding(.horizontal, 26)
 
-            Text(model.mode.explanation(model.displayName))
+            Text(model.windowModeAvailable ? model.mode.explanation(model.displayName)
+                 : "\(model.mode.explanation(model.displayName)) Window or App needs your Mac’s own screen, so it’s off while the lid is closed.")
                 .font(.system(size: 13))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 26)
                 .padding(.top, 22).padding(.bottom, 20)
 
             Divider().padding(.horizontal, 26)
@@ -414,10 +449,14 @@ struct SettingsView: View {
                                 }
                                 .buttonStyle(.borderless).help("Rename")
                             }
-                            Text("\(m.name) · " + (store.connectedKeys.contains(m.key) ? "Connected"
-                                                    : "Last connected \(Self.shortDate.string(from: m.lastSeen))"))
+                            Text("\(m.name)\(ExternalDisplay.keyHasNoSerial(m.key) ? " (every one of this model)" : "") · "
+                                 + (store.connectedKeys.contains(m.key) ? "Connected"
+                                    : "Last connected \(Self.shortDate.string(from: m.lastSeen))"))
                                 .font(.caption).foregroundStyle(.secondary)
                                 .lineLimit(1)
+                                .help(ExternalDisplay.keyHasNoSerial(m.key)
+                                      ? "This monitor doesn’t report a serial number, so this name and rule apply to every monitor of the same model."
+                                      : "")
                         }
                         Spacer()
                         Picker("", selection: Binding(get: { store.rule(for: m.key) }, set: { store.setRule($0, for: m.key) })) {
@@ -444,7 +483,7 @@ struct SettingsView: View {
                         Text("Needs Accessibility permission.").foregroundStyle(.secondary)
                         Spacer()
                         Button("Grant Access…") {
-                            AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+                            AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
                         }
                     }
                 }
@@ -458,6 +497,7 @@ struct SettingsView: View {
             Section {
                 Toggle("Launch at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, on in
+                        UserDefaults.standard.set(on, forKey: "launchAtLogin") // lets launch re-register after a move
                         do { if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() } }
                         catch { log("login item: \(error)") }
                     }
@@ -625,22 +665,26 @@ final class WindowPickerModel: ObservableObject {
             return
         }
 
+        // At most 4 screenshots at a time, so opening the grid with many windows stays light.
+        var queue = items.map(\.window).makeIterator()
         await withTaskGroup(of: (CGWindowID, NSImage?).self) { group in
-            for item in items {
-                let w = item.window
-                group.addTask {
-                    let c = SCStreamConfiguration()
-                    let scale = 360 / max(w.frame.width, 1)
-                    c.width = max(2, Int(w.frame.width * scale))
-                    c.height = max(2, Int(w.frame.height * scale))
-                    c.showsCursor = false
-                    guard let cg = try? await SCScreenshotManager.captureImage(
-                        contentFilter: SCContentFilter(desktopIndependentWindow: w), configuration: c) else { return (w.windowID, nil) }
-                    return (w.windowID, NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)))
-                }
+            for _ in 0..<4 { if let w = queue.next() { group.addTask { await Self.thumbnail(of: w) } } }
+            for await (id, image) in group {
+                if let image { thumbs[id] = image }
+                if let w = queue.next() { group.addTask { await Self.thumbnail(of: w) } }
             }
-            for await (id, image) in group { if let image { thumbs[id] = image } }
         }
+    }
+
+    private static func thumbnail(of w: SCWindow) async -> (CGWindowID, NSImage?) {
+        let c = SCStreamConfiguration()
+        let scale = 360 / max(w.frame.width, 1)
+        c.width = max(2, Int(w.frame.width * scale))
+        c.height = max(2, Int(w.frame.height * scale))
+        c.showsCursor = false
+        guard let cg = try? await SCScreenshotManager.captureImage(
+            contentFilter: SCContentFilter(desktopIndependentWindow: w), configuration: c) else { return (w.windowID, nil) }
+        return (w.windowID, NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)))
     }
 }
 
@@ -823,8 +867,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         c.width = max(2, Int(filter.contentRect.width * scale))
         c.height = max(2, Int(filter.contentRect.height * scale))
         c.pixelFormat = kCVPixelFormatType_32BGRA
-        c.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-        c.queueDepth = 5
+        c.minimumFrameInterval = CMTime(value: 1, timescale: 30) // plenty for slides and documents; half the work of 60
+        c.queueDepth = 3
         c.showsCursor = false
         c.scalesToFit = true
         c.preservesAspectRatio = true
@@ -858,8 +902,11 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         stream = s
         SCContentSharingPicker.shared.setConfiguration(PickerSetup.configuration, for: s)
         Task {
-            do { try await s.startCapture(); log("capture started") }
-            catch {
+            do {
+                try await s.startCapture(); log("capture started")
+                // Stopped or replaced while it was starting: don't leave an orphan capture running.
+                DispatchQueue.main.async { if self.stream !== s { Task { try? await s.stopCapture() }; log("dropped a capture that was replaced while starting") } }
+            } catch {
                 log("startCapture failed: \(error)")
                 DispatchQueue.main.async { if self.stream === s { self.stream = nil }; self.onFailed(error) }
             }
@@ -935,7 +982,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private func updateCursor() {
         guard let window, stream != nil else { return }
         let layer = window.cursorLayer
-        if tick % 3 == 0 { overShared = pointerIsOverSharedContent() }
+        if tick % 6 == 0 { overShared = pointerIsOverSharedContent() } // window list 10×/s; the pointer itself still moves at 60
         tick += 1
 
         guard overShared, !blanked, !screenRect.isNull, screenRect.width > 0, contentSize.width > 0,
@@ -1109,12 +1156,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
     private let capture = Capture()
     private let fence = PointerFence()
     private var rescueTimer: Timer?
+    private let rescueQueue = DispatchQueue(label: "WirePlay.rescue", qos: .utility)
+    private var rescueBusy = false
     private var target: ExternalDisplay?        // display currently presenting windows
     private var modes: [CGDirectDisplayID: ShowMode] = [:]
     private var rescanPending = false
+    /// Bumped on every mode change; async work checks it so a late callback can't undo a newer choice.
+    private var generation = 0
+    /// Displays waiting for their chooser when several connect at once.
+    private var pendingChoosers: [ExternalDisplay] = []
+    private var chooserDisplay: ExternalDisplay?
+    /// The presentation display dropped out while showing windows; resume if it's back soon.
+    private var lostKey: String?
+    private var graceTimer: Timer?
 
     func applicationDidFinishLaunching(_ note: Notification) {
-        log("launch")
+        log("launch \(appVersion) from \(Bundle.main.bundlePath)")
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = Glyph.menuBarImage
         let menu = NSMenu(); menu.delegate = self; statusItem.menu = menu
@@ -1128,6 +1185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
 
         capture.onStopped = { [weak self] in self?.endWindowMode(showDesktop: false) }
         capture.onFailed = { [weak self] error in
+            let failed = self?.target
             self?.endWindowMode(showDesktop: true)
             let a = NSAlert()
             a.messageText = "macOS didn’t allow WirePlay to show that window"
@@ -1136,9 +1194,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             NSApp.activate(ignoringOtherApps: true)
             switch a.runModal() {
             case .alertFirstButtonReturn:
-                if let d = self?.store.connectedKeys.isEmpty == false ? ExternalDisplay.online().first(where: { !$0.isVirtual }) : nil {
-                    self?.apply(.windowOrApp, to: d)
-                }
+                let online = ExternalDisplay.online().filter { !$0.isVirtual }
+                if let d = online.first(where: { $0 == failed }) ?? online.first { self?.apply(.windowOrApp, to: d) }
             case .alertSecondButtonReturn:
                 NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
             default: break
@@ -1160,8 +1217,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             self?.handle("choose")
         }
 
+        keepLoginItemCurrent()
         rescan()
         if CommandLine.arguments.contains("--settings") { showSettings() }
+    }
+
+    /// The login item points at the app's path. If the app was moved (e.g. ~/Applications to
+    /// /Applications), register it again so "Launch at login" keeps working.
+    private func keepLoginItemCurrent() {
+        let service = SMAppService.mainApp
+        if service.status == .enabled { UserDefaults.standard.set(true, forKey: "launchAtLogin") }
+        guard UserDefaults.standard.bool(forKey: "launchAtLogin") else { return }
+        do { try service.register(); log("login item registered for \(Bundle.main.bundlePath)") }
+        catch { log("login item: \(error)") }
     }
 
     func applicationWillTerminate(_ note: Notification) {
@@ -1216,8 +1284,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
         let ids = Set(displays.map(\.id))
 
         if let t = target {
-            if !ids.contains(t.id) { log("presenting display gone"); endWindowMode(showDesktop: false) }
-            else if let screen = t.screen { output?.fit(to: screen); updateFence() }
+            if !ids.contains(t.id) {
+                if lostKey == nil && capture.stream != nil { beginGrace(for: t) }
+                else if lostKey == nil { log("presenting display gone"); endWindowMode(showDesktop: false) }
+            } else if let screen = t.screen { output?.fit(to: screen); updateFence() }
         }
         for gone in known.subtracting(ids) { modes[gone] = nil }
 
@@ -1227,19 +1297,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
         for d in displays where !known.contains(d.id) {
             log("connected \(d.name) id=\(d.id) key=\(d.key) mirrored=\(d.isMirrored)")
             if d.isVirtual { continue }
+            if let lostKey, d.key == lostKey { resume(on: d); continue }
             let rule = store.rule(for: d.key)
             if rule == .ignore { log("ignoring \(d.name)"); continue }
-            if let mode = rule.mode { apply(mode, to: d) } else { showChooser(for: d) }
+            if let mode = rule.mode { apply(mode, to: d) } else { showChooser(for: d, queued: true) }
         }
         known = ids
     }
 
+    /// A cable blip or a TV input switch shouldn't end the presentation: keep capturing for a
+    /// few seconds and pick up where we were if the same monitor comes back.
+    private func beginGrace(for display: ExternalDisplay) {
+        log("presenting display dropped out; waiting 15 s for it to come back")
+        lostKey = display.key
+        output?.orderOut(nil)
+        updateFence() // no screen: pointer fence and window rescue pause
+        graceTimer?.invalidate()
+        graceTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: false) { [weak self] _ in
+            log("display didn't come back; stopping")
+            self?.endWindowMode(showDesktop: false)
+        }
+    }
+
+    private func resume(on display: ExternalDisplay) {
+        log("display is back; resuming")
+        graceTimer?.invalidate(); graceTimer = nil
+        lostKey = nil
+        target = display
+        modes[display.id] = .windowOrApp
+        setMirroring(display.id, on: false)
+        let gen = generation
+        waitForScreen(display, attempts: 40) { [weak self] screen in
+            guard let self, gen == self.generation, self.target == display, let screen else { return }
+            self.output?.fit(to: screen)
+            self.output?.orderFrontRegardless()
+            self.updateFence()
+        }
+    }
+
+    /// Window or App needs a screen other than the presentation display (lid closed + TV only has none).
+    private func hasOtherScreen(than display: ExternalDisplay) -> Bool {
+        NSScreen.screens.contains { $0.displayID != display.id }
+    }
+
     // MARK: Windows
 
-    func showChooser(for display: ExternalDisplay) {
+    /// `queued`: from a new connection. If a chooser or the window grid is already up, wait
+    /// for it instead of replacing it, so each display that connected gets asked.
+    func showChooser(for display: ExternalDisplay, queued: Bool = false) {
+        if queued && (chooser != nil || windowPicker != nil) {
+            if chooserDisplay != display && !pendingChoosers.contains(display) {
+                pendingChoosers.append(display)
+                log("queued the chooser for \(display.name)")
+            }
+            return
+        }
         chooser?.close()
+        chooserDisplay = display
         let model = ChooserModel(displayName: display.name, initial: modes[display.id] ?? .windowOrApp,
-                                 showingWindows: target == display && capture.stream != nil)
+                                 showingWindows: target == display && capture.stream != nil,
+                                 windowModeAvailable: hasOtherScreen(than: display))
         let panel = NSPanel(contentRect: .zero, styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
@@ -1251,6 +1368,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             panel?.close()
             guard let self else { return }
             self.chooser = nil
+            self.chooserDisplay = nil
+            defer { self.showNextChooserSoon() }
             switch result {
             case .cancel: break
             case .ignore:
@@ -1262,10 +1381,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             }
         }
         panel.setContentSize(panel.contentView!.fittingSize)
-        place(panel, yOffset: 80)
+        place(panel, yOffset: 80, avoiding: display.id)
         chooser = panel
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
+    }
+
+    /// Show the next waiting chooser once nothing else is on screen (after the current mode has
+    /// had a moment to open its window grid).
+    private func showNextChooserSoon() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, self.chooser == nil, self.windowPicker == nil else { return }
+            let online = Set(ExternalDisplay.online().map(\.id))
+            while !self.pendingChoosers.isEmpty {
+                let next = self.pendingChoosers.removeFirst()
+                if online.contains(next.id) { self.showChooser(for: next); return }
+            }
+        }
     }
 
     @objc func showSettings() {
@@ -1283,9 +1415,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
         settings?.makeKeyAndOrderFront(nil)
     }
 
-    /// Keep our windows on the laptop screen, where the presenter is looking.
-    private func place(_ w: NSWindow, yOffset: CGFloat) {
-        let home = NSScreen.screens.first { $0.displayID.map { CGDisplayIsBuiltin($0) != 0 } ?? false } ?? NSScreen.main
+    /// Keep our windows on the laptop screen, where the presenter is looking; never on the TV
+    /// (with the lid closed, NSScreen.main can be the TV, under the black cover).
+    private func place(_ w: NSWindow, yOffset: CGFloat, avoiding: CGDirectDisplayID? = nil) {
+        let avoid = Set([avoiding, target?.id].compactMap { $0 })
+        let home = NSScreen.screens.first { $0.displayID.map { CGDisplayIsBuiltin($0) != 0 } ?? false }
+            ?? NSScreen.screens.first { !avoid.contains($0.displayID ?? 0) }
+            ?? NSScreen.main
         if let f = home?.visibleFrame {
             w.setFrameOrigin(NSPoint(x: f.midX - w.frame.width / 2, y: f.midY - w.frame.height / 2 + yOffset))
         }
@@ -1295,22 +1431,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
 
     func apply(_ mode: ShowMode, to display: ExternalDisplay) {
         log("apply \(mode.rawValue) to \(display.name)")
+        generation += 1
         modes[display.id] = mode
         switch mode {
         case .entireScreen:
             if target == display { endWindowMode(showDesktop: false) }
-            setMirroring(display.id, on: true)
+            if !setMirroring(display.id, on: true) { mirroringFailed(display, on: true) }
         case .extendedDisplay:
             if target == display { endWindowMode(showDesktop: true) }
-            setMirroring(display.id, on: false)
+            if !setMirroring(display.id, on: false) { mirroringFailed(display, on: false) }
         case .windowOrApp:
-            setMirroring(display.id, on: false)
+            guard hasOtherScreen(than: display) else {
+                log("Window or App needs another screen; \(display.name) is the only one")
+                modes[display.id] = nil
+                let a = NSAlert()
+                a.messageText = "Window or App needs your Mac’s own screen"
+                a.informativeText = "“\(display.name)” is the only screen right now (is the lid closed?). Open the lid, or choose Entire Screen instead."
+                NSApp.activate(ignoringOtherApps: true)
+                a.runModal()
+                return
+            }
+            if !setMirroring(display.id, on: false) { mirroringFailed(display, on: false); return }
+            let gen = generation
             waitForScreen(display, attempts: 40) { [weak self] screen in
-                guard let self else { return }
+                // A newer choice (or a disconnect) since this started: leave it alone.
+                guard let self, gen == self.generation, self.modes[display.id] == .windowOrApp else { return }
                 guard let screen else { log("no NSScreen for \(display.id)"); return }
                 self.beginWindowMode(on: display, screen: screen)
             }
         }
+    }
+
+    private func mirroringFailed(_ display: ExternalDisplay, on: Bool) {
+        let a = NSAlert()
+        a.messageText = on ? "Couldn’t mirror to “\(display.name)”" : "Couldn’t switch “\(display.name)” out of mirroring"
+        a.informativeText = "macOS didn’t accept the display change. Try again, or change it in System Settings › Displays."
+        NSApp.activate(ignoringOtherApps: true)
+        a.runModal()
     }
 
     /// After un-mirroring, the display takes a moment to appear as its own NSScreen.
@@ -1354,6 +1511,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             panel?.close()
             guard let self else { return }
             self.windowPicker = nil
+            defer { self.showNextChooserSoon() }
             guard let windows, !windows.isEmpty else {
                 log("window chooser cancelled")
                 if self.capture.stream == nil { self.endWindowMode(showDesktop: true) }
@@ -1365,7 +1523,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             panel?.close(); self?.windowPicker = nil; self?.presentSystemPicker()
         }
         panel.setContentSize(panel.contentView!.fittingSize)
-        place(panel, yOffset: 40)
+        place(panel, yOffset: 40, avoiding: t.id)
         windowPicker = panel
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
@@ -1383,9 +1541,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             capture.apply(SCContentFilter(desktopIndependentWindow: windows[0]), windows: windows)
             return
         }
+        let gen = generation, display = target
         Task { @MainActor in
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+                // Mode changed or presentation ended while we waited: drop this.
+                guard gen == self.generation, self.target == display, display != nil else { log("share dropped (mode changed)"); return }
                 let home = self.target.map { primaryDisplayID(excluding: $0.id) } ?? CGMainDisplayID()
                 // The display holding most of the chosen windows (normally the MacBook's).
                 let display = content.displays.max { a, b in
@@ -1432,6 +1593,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
     }
 
     private func endWindowMode(showDesktop: Bool) {
+        generation += 1
+        graceTimer?.invalidate(); graceTimer = nil
+        lostKey = nil
         windowPicker?.close(); windowPicker = nil
         capture.stop()
         SCContentSharingPicker.shared.isActive = false
@@ -1455,8 +1619,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
         guard store.rescueWindows else { return }
         let fencedCG = CGDisplayBounds(t.id)
         let homeCG = CGDisplayBounds(primaryDisplayID(excluding: t.id))
-        rescueTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
-            WindowRescue.run(fenced: fencedCG, home: homeCG)
+        // Accessibility calls can block on a busy app, so they run off the main thread, one pass at a time.
+        rescueTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self, !self.rescueBusy else { return }
+            self.rescueBusy = true
+            self.rescueQueue.async {
+                WindowRescue.run(fenced: fencedCG, home: homeCG)
+                DispatchQueue.main.async { self.rescueBusy = false }
+            }
         }
     }
 
@@ -1466,6 +1636,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
         DispatchQueue.main.async {
             guard self.target != nil else { return }
             self.capture.apply(filter)
+            self.showNextChooserSoon()
         }
     }
 
@@ -1474,6 +1645,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             log("picker cancelled")
             // Cancelling the first pick backs out of Window or App mode; the display stays extended.
             if self.capture.stream == nil { self.endWindowMode(showDesktop: true) }
+            self.showNextChooserSoon()
         }
     }
 
@@ -1522,6 +1694,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             menu.addItem(whenConnected)
             menu.addItem(.separator())
         }
+        menu.addItem(disabled("WirePlay \(appVersion)"))
         let s = item("Settings…", #selector(showSettings), nil); s.keyEquivalent = ","
         menu.addItem(s)
         menu.addItem(NSMenuItem(title: "Quit WirePlay", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))

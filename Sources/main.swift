@@ -17,6 +17,7 @@
 import Cocoa
 import Combine
 import CoreMedia
+import Network
 @preconcurrency import ScreenCaptureKit
 import ServiceManagement
 import SwiftUI
@@ -285,8 +286,14 @@ struct ExternalDisplay: Equatable {
     var screen: NSScreen? { NSScreen.screens.first { $0.displayID == id } }
     var isMirrored: Bool { CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay }
 
-    /// The name you gave it in Settings, else what the monitor calls itself.
-    var name: String { Store.shared.monitor(key)?.customName ?? hardwareName }
+    /// The name you gave it in Settings, else the AirPlay receiver's name, else what the monitor calls itself.
+    var name: String { Store.shared.monitor(key)?.customName ?? airPlayNames[id] ?? airPlayReceiver ?? hardwareName }
+
+    /// macOS names an AirPlay display "<receiver> (AirPlay)", e.g. "Mike-Office (AirPlay)".
+    var airPlayReceiver: String? {
+        let n = hardwareName
+        return n.hasSuffix(" (AirPlay)") ? String(n.dropLast(" (AirPlay)".count)) : nil
+    }
 
     var hardwareName: String {
         screen?.localizedName ?? Store.shared.monitor(key)?.name ?? "External Display"
@@ -306,6 +313,9 @@ struct ExternalDisplay: Equatable {
         return ids.prefix(Int(count)).filter { CGDisplayIsBuiltin($0) == 0 }.map(ExternalDisplay.init)
     }
 }
+
+/// AirPlay displays WirePlay started, by display ID → receiver name ("Executive-Room").
+var airPlayNames: [CGDirectDisplayID: String] = [:]
 
 extension NSScreen {
     var displayID: CGDirectDisplayID? {
@@ -1143,6 +1153,407 @@ enum Glyph {
     }
 }
 
+// MARK: - Accessibility helpers (for driving Control Center's Screen Mirroring)
+
+enum AX {
+    static func attribute(_ el: AXUIElement, _ name: String) -> AnyObject? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, name as CFString, &value) == .success else { return nil }
+        return value as AnyObject?
+    }
+    static func string(_ el: AXUIElement, _ name: String) -> String? { attribute(el, name) as? String }
+    static func children(_ el: AXUIElement) -> [AXUIElement] { (attribute(el, kAXChildrenAttribute) as? [AXUIElement]) ?? [] }
+    static func role(_ el: AXUIElement) -> String { string(el, kAXRoleAttribute) ?? "" }
+    static func title(_ el: AXUIElement) -> String { string(el, kAXTitleAttribute) ?? "" }
+    static func identifier(_ el: AXUIElement) -> String { string(el, "AXIdentifier") ?? "" }
+    /// Every human-readable string attached to an element.
+    static func labels(_ el: AXUIElement) -> [String] {
+        var out = [title(el), string(el, kAXDescriptionAttribute) ?? "", identifier(el), string(el, kAXHelpAttribute) ?? ""]
+        if let v = attribute(el, kAXValueAttribute) as? String { out.append(v) }
+        return out.filter { !$0.isEmpty }
+    }
+    @discardableResult
+    static func press(_ el: AXUIElement) -> Bool { AXUIElementPerformAction(el, kAXPressAction as CFString) == .success }
+
+    /// Depth-first walk with a node budget; `visit` returns true to stop.
+    static func walk(_ root: AXUIElement, maxNodes: Int = 3000, maxDepth: Int = 30, _ visit: (AXUIElement, Int) -> Bool) {
+        var budget = maxNodes
+        func go(_ el: AXUIElement, _ depth: Int) -> Bool {
+            guard budget > 0, depth <= maxDepth else { return false }
+            budget -= 1
+            if visit(el, depth) { return true }
+            for child in children(el) where go(child, depth + 1) { return true }
+            return false
+        }
+        _ = go(root, 0)
+    }
+
+    static func first(in root: AXUIElement, where match: (AXUIElement) -> Bool) -> AXUIElement? {
+        var found: AXUIElement?
+        walk(root) { el, _ in if match(el) { found = el; return true }; return false }
+        return found
+    }
+
+    static func dump(_ root: AXUIElement, maxNodes: Int = 600) -> String {
+        var lines: [String] = []
+        walk(root, maxNodes: maxNodes) { el, depth in
+            let value = attribute(el, kAXValueAttribute).map { "\($0)" } ?? ""
+            let actions: [String] = {
+                var names: CFArray?
+                return AXUIElementCopyActionNames(el, &names) == .success ? ((names as? [String]) ?? []) : []
+            }()
+            lines.append(String(repeating: "  ", count: depth)
+                + "\(role(el)) [\(string(el, kAXSubroleAttribute) ?? "")] title=\"\(title(el))\" desc=\"\(string(el, kAXDescriptionAttribute) ?? "")\""
+                + " id=\"\(identifier(el))\" value=\"\(value.prefix(40))\" actions=\(actions.filter { $0 != "AXShowMenu" && $0 != "AXScrollToVisible" })")
+            return false
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
+/// Finds Control Center and its windows. On macOS 26+ the menu bar items live in MenuBarAgent,
+/// while Control Center's own panel (and its Screen Mirroring list) belong to ControlCenter.
+enum ControlCenterUI {
+    static let hostNames = ["ControlCenter", "MenuBarAgent"]
+
+    static func hosts() -> [(name: String, app: AXUIElement)] {
+        NSWorkspace.shared.runningApplications.compactMap { app in
+            guard let name = app.executableURL?.lastPathComponent, hostNames.contains(name) else { return nil }
+            let el = AXUIElementCreateApplication(app.processIdentifier)
+            AXUIElementSetMessagingTimeout(el, 2)
+            return (name, el)
+        }
+    }
+
+    /// The Control Center item in the menu bar.
+    static func menuBarItem() -> AXUIElement? {
+        for (_, app) in hosts() {
+            var roots: [AXUIElement] = []
+            for attr in ["AXExtrasMenuBar", kAXMenuBarAttribute] {
+                if let v = AX.attribute(app, attr), CFGetTypeID(v) == AXUIElementGetTypeID() { roots.append(v as! AXUIElement) }
+            }
+            if roots.isEmpty { roots = AX.children(app) }
+            for root in roots {
+                if let item = AX.first(in: root, where: { el in
+                    AX.role(el) == kAXMenuBarItemRole
+                        && AX.labels(el).contains { $0.lowercased().contains("controlcenter") || $0.lowercased().contains("control center") }
+                }) { return item }
+            }
+        }
+        return nil
+    }
+
+    static func windows() -> [(host: String, window: AXUIElement)] {
+        hosts().flatMap { host in AX.children(host.app).filter { AX.role($0) == kAXWindowRole }.map { (host.name, $0) } }
+    }
+}
+
+/// `WirePlay --dump-airplay`: opens Control Center and its Screen Mirroring list, writes what
+/// Accessibility sees to ~/Library/Logs/WirePlay-airplay-ax.txt, and closes them. Connects nothing.
+enum AirPlayProbe {
+    static func run() {
+        var out = ["WirePlay \(appVersion) Screen Mirroring probe \(Date())", "Accessibility trusted: \(AXIsProcessTrusted())"]
+        defer {
+            let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/WirePlay-airplay-ax.txt")
+            try? out.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        }
+        guard AXIsProcessTrusted() else { out.append("Not trusted — grant Accessibility to WirePlay first."); return }
+        guard let cc = ControlCenterUI.menuBarItem() else {
+            out.append("Control Center menu bar item not found. Hosts and their trees:")
+            for (name, app) in ControlCenterUI.hosts() { out.append("== \(name)"); out.append(AX.dump(app, maxNodes: 200)) }
+            return
+        }
+        out.append("Control Center item: \(AX.labels(cc))")
+        AX.press(cc)
+        Thread.sleep(forTimeInterval: 1.2)
+        for (host, w) in ControlCenterUI.windows() { out.append("== Control Center open — \(host) window"); out.append(AX.dump(w)) }
+
+        // The Screen Mirroring tile; its list of receivers opens inside Control Center.
+        let tile = ControlCenterUI.windows().lazy.compactMap { pair in
+            AX.first(in: pair.window) { el in AX.labels(el).contains { $0.lowercased().contains("screen mirroring") || $0.lowercased().contains("screenmirroring") } }
+        }.first
+        if let tile {
+            out.append("Screen Mirroring tile: role=\(AX.role(tile)) labels=\(AX.labels(tile))")
+            AX.press(tile)
+            Thread.sleep(forTimeInterval: 1.5)
+            for (host, w) in ControlCenterUI.windows() { out.append("== Screen Mirroring open — \(host) window"); out.append(AX.dump(w, maxNodes: 900)) }
+        } else {
+            out.append("Screen Mirroring tile not found")
+        }
+        ScreenMirroring.close()
+        out.append("Receivers via the driver: \((try? ScreenMirroring.listedReceivers())?.joined(separator: ", ") ?? "failed")")
+        out.append("Windows after closing: \(ControlCenterUI.windows().count)")
+    }
+}
+
+// MARK: - AirPlay
+//
+// There is no public API for starting AirPlay screen sharing, so WirePlay drives the same
+// Screen Mirroring list you'd click in the menu bar or Control Center (through Accessibility),
+// asks for an extended display, and then treats that AirPlay display exactly like an HDMI
+// one: black cover, WirePlay's own window grid, pointer fence.
+
+/// Finds AirPlay receivers on the network (Bonjour), so the menu can list them without
+/// opening Control Center.
+final class AirPlayBrowser: ObservableObject {
+    @Published private(set) var receivers: [String] = []
+    private var browser: NWBrowser?
+    private let ownName = Host.current().localizedName ?? ""
+
+    func start() {
+        guard browser == nil else { return }
+        let b = NWBrowser(for: .bonjour(type: "_airplay._tcp", domain: nil), using: .tcp)
+        b.browseResultsChangedHandler = { [weak self] results, _ in
+            let names = results.compactMap { r -> String? in
+                if case let .service(name, _, _, _) = r.endpoint { return name }
+                return nil
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let first = self.receivers.isEmpty
+                self.receivers = Array(Set(names)).filter { $0 != self.ownName }
+                    .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+                if first && !self.receivers.isEmpty { log("AirPlay: found \(self.receivers.count) receivers") }
+            }
+        }
+        b.stateUpdateHandler = { state in if case .failed(let e) = state { log("AirPlay browse failed: \(e)") } }
+        b.start(queue: .main)
+        browser = b
+    }
+}
+
+/// Drives macOS's Screen Mirroring list. All calls block (they wait for the UI), so run them
+/// off the main thread.
+enum ScreenMirroring {
+    enum Failure: LocalizedError {
+        case notTrusted, listNotFound, receiverNotFound(String), pressFailed
+        var errorDescription: String? {
+            switch self {
+            case .notTrusted: return "WirePlay needs Accessibility permission to start AirPlay."
+            case .listNotFound: return "Couldn’t open the Screen Mirroring list."
+            case .receiverNotFound(let n): return "“\(n)” isn’t in the Screen Mirroring list right now."
+            case .pressFailed: return "macOS didn’t accept the click."
+            }
+        }
+    }
+
+    private static let listID = "screen-mirroring-device-list"
+    private static let devicePrefix = "screen-mirroring-device-"
+
+    private static func wait(_ seconds: Double, until done: () -> Bool) -> Bool {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end { if done() { return true }; Thread.sleep(forTimeInterval: 0.1) }
+        return done()
+    }
+
+    /// The Screen Mirroring item in the menu bar (if the user keeps it there).
+    private static func menuExtra() -> AXUIElement? {
+        for (_, app) in ControlCenterUI.hosts() {
+            if let el = AX.first(in: app, where: { AX.identifier($0) == "com.apple.menuextra.screen-mirroring" }) { return el }
+        }
+        return nil
+    }
+
+    /// The open Screen Mirroring list, wherever it's hosted.
+    private static func listWindow() -> AXUIElement? {
+        ControlCenterUI.windows().first { pair in AX.first(in: pair.window) { AX.identifier($0) == listID } != nil }?.window
+    }
+
+    private static func openList() throws -> AXUIElement {
+        if let w = listWindow() { return w }
+        if let item = menuExtra() {
+            AX.press(item)
+        } else if let cc = ControlCenterUI.menuBarItem() {
+            // Not in the menu bar: open Control Center and its Screen Mirroring tile.
+            AX.press(cc)
+            var tile: AXUIElement?
+            _ = wait(2) {
+                tile = ControlCenterUI.windows().lazy.compactMap { pair in
+                    AX.first(in: pair.window) { el in
+                        AX.role(el) != kAXMenuBarItemRole && AX.labels(el).contains { $0.lowercased().contains("screen mirroring") }
+                    }
+                }.first
+                return tile != nil
+            }
+            guard let tile else { throw Failure.listNotFound }
+            AX.press(tile)
+        } else {
+            throw Failure.listNotFound
+        }
+        var w: AXUIElement?
+        guard wait(3, until: { w = listWindow(); return w != nil }), let w else { throw Failure.listNotFound }
+        return w
+    }
+
+    static func close() {
+        guard listWindow() != nil else { return }
+        if let item = menuExtra() { AX.press(item) } else if let cc = ControlCenterUI.menuBarItem() { AX.press(cc) }
+        _ = wait(1.5) { listWindow() == nil }
+    }
+
+    private struct Device { let name: String; let toggle: AXUIElement; let id: String; let on: Bool }
+
+    private static func devices(in w: AXUIElement) -> [Device] {
+        var out: [Device] = []
+        AX.walk(w) { el, _ in
+            let id = AX.identifier(el)
+            if AX.role(el) == kAXCheckBoxRole, id.hasPrefix(devicePrefix) {
+                let on = (AX.attribute(el, kAXValueAttribute) as? NSNumber)?.boolValue ?? false
+                out.append(Device(name: AX.string(el, kAXDescriptionAttribute) ?? "", toggle: el, id: id, on: on))
+            }
+            return false
+        }
+        return out
+    }
+
+    private static func device(named name: String, in w: AXUIElement) -> Device? {
+        if let d = devices(in: w).first(where: { $0.name == name }) { return d }
+        // Not among the first few: expand "Show More" and look again.
+        if let more = AX.first(in: w, where: { AX.role($0) == "AXDisclosureTriangle" }) {
+            AX.press(more)
+            var found: Device?
+            _ = wait(1.5) { found = devices(in: w).first { $0.name == name }; return found != nil }
+            return found
+        }
+        return nil
+    }
+
+    /// Names macOS currently offers in the list (for diagnostics).
+    static func listedReceivers() throws -> [String] {
+        guard AXIsProcessTrusted() else { throw Failure.notTrusted }
+        let w = try openList(); defer { close() }
+        return devices(in: w).map { "\($0.name)\($0.on ? " (on)" : "")" }
+    }
+
+    /// Starts AirPlay to `name` and asks for an extended display. Returns once macOS has been
+    /// told; the display itself shows up a few seconds later.
+    static func connect(_ name: String) throws {
+        guard AXIsProcessTrusted() else { throw Failure.notTrusted }
+        let w = try openList()
+        defer { close() }
+        guard let d = device(named: name, in: w) else { throw Failure.receiverNotFound(name) }
+        if d.on { log("AirPlay: \(name) already connected"); return }
+        guard AX.press(d.toggle) else { throw Failure.pressFailed }
+        log("AirPlay: asked macOS to connect to \(name)")
+        answerShowSheet(for: name)
+    }
+
+    /// macOS may ask "What do you want to show on …?" (unless a default is set for that
+    /// receiver). Pick Extended Display; WirePlay then shows only the chosen windows on it.
+    private static func answerShowSheet(for name: String) {
+        var sheet: AXUIElement?
+        let appeared = wait(6) {
+            sheet = allWindows().first { w in
+                AX.first(in: w) { el in AX.labels(el).contains { $0.contains("What do you want to show") } } != nil
+            }
+            return sheet != nil
+        }
+        guard appeared, let sheet else { log("AirPlay: no 'What do you want to show' sheet (a default may be set)"); return }
+        log("AirPlay sheet:\n" + AX.dump(sheet, maxNodes: 200))
+        if let card = AX.first(in: sheet, where: { el in AX.labels(el).contains { $0 == "Extended Display" } && AX.press(el) }) {
+            _ = card
+            Thread.sleep(forTimeInterval: 0.4)
+        } else {
+            log("AirPlay: Extended Display option not found in the sheet")
+        }
+        // Confirm with the sheet's default button ("Use as Extended Display" or similar).
+        if let def = AX.attribute(sheet, kAXDefaultButtonAttribute), CFGetTypeID(def) == AXUIElementGetTypeID() {
+            AX.press(def as! AXUIElement)
+            log("AirPlay: confirmed the sheet")
+        } else if let button = AX.first(in: sheet, where: { el in
+            AX.role(el) == kAXButtonRole && AX.labels(el).contains { $0.localizedCaseInsensitiveContains("extend") }
+        }) {
+            AX.press(button)
+            log("AirPlay: confirmed the sheet (\(AX.labels(button)))")
+        } else {
+            log("AirPlay: couldn't find the sheet's confirm button")
+        }
+    }
+
+    /// Windows of every app that might host the AirPlay sheet.
+    private static func allWindows() -> [AXUIElement] {
+        let names: Set<String> = ["AirPlayUIAgent", "ControlCenter", "MenuBarAgent", "SystemUIServer", "WindowManager"]
+        return NSWorkspace.shared.runningApplications.flatMap { app -> [AXUIElement] in
+            guard let n = app.executableURL?.lastPathComponent, names.contains(n) else { return [] }
+            let el = AXUIElementCreateApplication(app.processIdentifier)
+            AXUIElementSetMessagingTimeout(el, 1)
+            return AX.children(el).filter { AX.role($0) == kAXWindowRole }
+        }
+    }
+
+    /// Stops AirPlay to `name` (its "Stop Mirroring" button in the list).
+    static func disconnect(_ name: String) throws {
+        guard AXIsProcessTrusted() else { throw Failure.notTrusted }
+        let w = try openList()
+        defer { close() }
+        guard let d = device(named: name, in: w) else { throw Failure.receiverNotFound(name) }
+        if let stop = AX.first(in: w, where: { el in
+            AX.role(el) == kAXButtonRole && AX.identifier(el) == d.id && (AX.string(el, kAXDescriptionAttribute) ?? "").contains("Stop")
+        }) {
+            AX.press(stop)
+        } else if d.on {
+            AX.press(d.toggle)
+        }
+        log("AirPlay: disconnected \(name)")
+    }
+}
+
+// MARK: AirPlay receiver picker
+
+final class AirPlayPickerModel: ObservableObject {
+    @Published var connecting: String?
+    @Published var error: String?
+    let browser: AirPlayBrowser
+    var onPick: (String) -> Void = { _ in }
+    var onCancel: () -> Void = {}
+    init(browser: AirPlayBrowser) { self.browser = browser }
+}
+
+struct AirPlayPickerView: View {
+    @ObservedObject var model: AirPlayPickerModel
+    @ObservedObject var browser: AirPlayBrowser
+
+    init(model: AirPlayPickerModel) { self.model = model; self.browser = model.browser }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text("AirPlay to…").font(.system(size: 17, weight: .semibold)).padding(.top, 22)
+            Text("Pick a TV. WirePlay connects, blanks it, and lets you choose which windows to show.")
+                .font(.system(size: 12)).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                .padding(.horizontal, 24).padding(.top, 4).padding(.bottom, 12)
+            ZStack {
+                List(browser.receivers, id: \.self) { name in
+                    Button { model.onPick(name) } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: "tv").frame(width: 22).foregroundStyle(Color.accentColor)
+                            Text(name)
+                            Spacer()
+                            if model.connecting == name { ProgressView().controlSize(.small) }
+                        }
+                        .contentShape(Rectangle())
+                        .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.connecting != nil)
+                }
+                if browser.receivers.isEmpty { ProgressView("Looking for AirPlay TVs…") }
+            }
+            .frame(height: 300)
+            if let error = model.error {
+                Text(error).font(.system(size: 12)).foregroundStyle(.red).multilineTextAlignment(.center)
+                    .padding(.horizontal, 24).padding(.top, 8)
+            }
+            Divider().padding(.top, 10)
+            HStack {
+                Spacer()
+                Button("Cancel") { model.onCancel() }.keyboardShortcut(.cancelAction)
+            }
+            .controlSize(.large).padding(.horizontal, 22).padding(.vertical, 12)
+        }
+        .frame(width: 420)
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCContentSharingPickerObserver {
@@ -1169,6 +1580,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
     /// The presentation display dropped out while showing windows; resume if it's back soon.
     private var lostKey: String?
     private var graceTimer: Timer?
+    // AirPlay
+    private let airPlay = AirPlayBrowser()
+    private let airPlayQueue = DispatchQueue(label: "WirePlay.airplay")
+    private var airPlayPicker: NSPanel?
+    private var airPlayPickerModel: AirPlayPickerModel?
+    private var pendingAirPlay: (name: String, until: Date)? // asked macOS to connect; display not here yet
+    private var airPlayReceiver: String?                       // receiver behind the current target
 
     func applicationDidFinishLaunching(_ note: Notification) {
         log("launch \(appVersion) from \(Bundle.main.bundlePath)")
@@ -1218,6 +1636,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
         }
 
         keepLoginItemCurrent()
+        airPlay.start()
         rescan()
         if CommandLine.arguments.contains("--settings") { showSettings() }
     }
@@ -1261,12 +1680,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             } else if let d = ExternalDisplay.online().first(where: { !$0.isVirtual }) {
                 showChooser(for: d)
             } else {
-                let a = NSAlert()
-                a.messageText = "No external display connected"
-                a.informativeText = "Connect a monitor or TV with HDMI or USB-C and WirePlay will ask what to show on it."
-                a.addButton(withTitle: "OK"); a.addButton(withTitle: "Open WirePlay Settings")
-                NSApp.activate(ignoringOtherApps: true)
-                if a.runModal() == .alertSecondButtonReturn { showSettings() }
+                showAirPlayPicker() // nothing plugged in: AirPlay to a TV instead
             }
         }
     }
@@ -1285,7 +1699,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
 
         if let t = target {
             if !ids.contains(t.id) {
-                if lostKey == nil && capture.stream != nil { beginGrace(for: t) }
+                if airPlayReceiver != nil { log("AirPlay display went away"); airPlayReceiver = nil; endWindowMode(showDesktop: false) }
+                else if lostKey == nil && capture.stream != nil { beginGrace(for: t) }
                 else if lostKey == nil { log("presenting display gone"); endWindowMode(showDesktop: false) }
             } else if let screen = t.screen { output?.fit(to: screen); updateFence() }
         }
@@ -1296,6 +1711,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
 
         for d in displays where !known.contains(d.id) {
             log("connected \(d.name) id=\(d.id) key=\(d.key) mirrored=\(d.isMirrored)")
+            // The receiver we just asked macOS to AirPlay to. Match it by name; fall back to the
+            // first new virtual display in case macOS names it differently.
+            if let pending = pendingAirPlay, Date() < pending.until,
+               d.airPlayReceiver == pending.name || (d.airPlayReceiver == nil && d.isVirtual) {
+                airPlayConnected(pending.name, display: d); continue
+            }
             if d.isVirtual { continue }
             if let lostKey, d.key == lostKey { resume(on: d); continue }
             let rule = store.rule(for: d.key)
@@ -1341,6 +1762,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
     }
 
     // MARK: Windows
+
+    // MARK: AirPlay
+
+    @objc func showAirPlayPicker() {
+        airPlayPicker?.close()
+        let model = AirPlayPickerModel(browser: airPlay)
+        let panel = NSPanel(contentRect: .zero, styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isMovableByWindowBackground = true
+        panel.level = .floating
+        panel.isReleasedWhenClosed = false
+        panel.contentView = NSHostingView(rootView: AirPlayPickerView(model: model))
+        model.onPick = { [weak self] name in self?.connectAirPlay(name) }
+        model.onCancel = { [weak self] in self?.closeAirPlayPicker() }
+        panel.setContentSize(panel.contentView!.fittingSize)
+        place(panel, yOffset: 40)
+        airPlayPicker = panel
+        airPlayPickerModel = model
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    private func closeAirPlayPicker() {
+        airPlayPicker?.close(); airPlayPicker = nil; airPlayPickerModel = nil
+    }
+
+    @objc private func airPlayMenuPick(_ sender: NSMenuItem) {
+        if let name = sender.representedObject as? String { connectAirPlay(name) }
+    }
+
+    /// Ask macOS (via the Screen Mirroring list) to AirPlay to `name` as an extended display.
+    func connectAirPlay(_ name: String) {
+        guard AXIsProcessTrusted() else {
+            let a = NSAlert()
+            a.messageText = "Allow WirePlay to start AirPlay"
+            a.informativeText = "macOS has no way for apps to start AirPlay directly, so WirePlay uses the Screen Mirroring menu for you. That needs Accessibility permission: turn on WirePlay in System Settings › Privacy & Security › Accessibility, then try again."
+            a.addButton(withTitle: "Open System Settings"); a.addButton(withTitle: "Cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            if a.runModal() == .alertFirstButtonReturn {
+                AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+            }
+            return
+        }
+        if target != nil { endWindowMode(showDesktop: false) } // one presentation at a time
+        log("AirPlay: connecting to \(name)")
+        airPlayPickerModel?.connecting = name
+        airPlayPickerModel?.error = nil
+        pendingAirPlay = (name, Date().addingTimeInterval(25))
+        airPlayQueue.async { [weak self] in
+            do { try ScreenMirroring.connect(name) }
+            catch {
+                log("AirPlay: \(error.localizedDescription)")
+                DispatchQueue.main.async { self?.airPlayFailed(name, error.localizedDescription) }
+            }
+        }
+        // If no display turns up, say so instead of waiting forever.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25) { [weak self] in
+            guard let self, self.pendingAirPlay?.name == name else { return }
+            self.airPlayFailed(name, "“\(name)” didn’t connect. Is it on, and on the same network?")
+        }
+    }
+
+    private func airPlayFailed(_ name: String, _ message: String) {
+        guard pendingAirPlay?.name == name else { return }
+        pendingAirPlay = nil
+        if let model = airPlayPickerModel {
+            model.connecting = nil; model.error = message
+        } else {
+            let a = NSAlert(); a.messageText = "AirPlay to “\(name)” didn’t start"; a.informativeText = message
+            NSApp.activate(ignoringOtherApps: true); a.runModal()
+        }
+    }
+
+    /// The AirPlay display appeared: cover it and open the window grid, like Window or App.
+    private func airPlayConnected(_ name: String, display: ExternalDisplay) {
+        log("AirPlay: \(name) connected as display \(display.id)")
+        pendingAirPlay = nil
+        airPlayNames[display.id] = name
+        airPlayReceiver = name
+        closeAirPlayPicker()
+        apply(.windowOrApp, to: display)
+    }
+
+    @objc private func stopAirPlay() {
+        guard let name = airPlayReceiver else { return }
+        airPlayReceiver = nil
+        endWindowMode(showDesktop: false)
+        airPlayQueue.async {
+            do { try ScreenMirroring.disconnect(name) } catch { log("AirPlay: stop failed: \(error.localizedDescription)") }
+        }
+    }
 
     /// `queued`: from a new connection. If a chooser or the window grid is already up, wait
     /// for it instead of replacing it, so each display that connected gets asked.
@@ -1593,6 +2106,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
     }
 
     private func endWindowMode(showDesktop: Bool) {
+        // An AirPlay TV left as a bare extended desktop would show your desktop to the room:
+        // disconnect AirPlay instead.
+        if showDesktop, let name = airPlayReceiver {
+            airPlayReceiver = nil
+            airPlayQueue.async {
+                do { try ScreenMirroring.disconnect(name) } catch { log("AirPlay: stop failed: \(error.localizedDescription)") }
+            }
+        }
         generation += 1
         graceTimer?.invalidate(); graceTimer = nil
         lostKey = nil
@@ -1694,6 +2215,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             menu.addItem(whenConnected)
             menu.addItem(.separator())
         }
+        // AirPlay
+        if let name = airPlayReceiver {
+            menu.addItem(item("Stop AirPlay to “\(name)”", #selector(stopAirPlay), nil))
+        } else if let pending = pendingAirPlay {
+            menu.addItem(disabled("Connecting to “\(pending.name)”…"))
+        } else {
+            let airPlayItem = NSMenuItem(title: "AirPlay to", action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            for name in airPlay.receivers {
+                let i = NSMenuItem(title: name, action: #selector(airPlayMenuPick(_:)), keyEquivalent: "")
+                i.target = self; i.representedObject = name; i.image = NSImage(systemSymbolName: "tv", accessibilityDescription: nil)
+                sub.addItem(i)
+            }
+            if airPlay.receivers.isEmpty { sub.addItem(disabled("Looking for AirPlay TVs…")) }
+            sub.addItem(.separator())
+            sub.addItem(item("Choose…", #selector(showAirPlayPicker), nil))
+            airPlayItem.submenu = sub
+            menu.addItem(airPlayItem)
+        }
+        menu.addItem(.separator())
         menu.addItem(disabled("WirePlay \(appVersion)"))
         let s = item("Settings…", #selector(showSettings), nil); s.keyEquivalent = ","
         menu.addItem(s)
@@ -1724,13 +2265,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
     }
 
     @objc private func changeWindows() { presentPicker() }
-    @objc private func stopWindows() { if let t = target { endWindowMode(showDesktop: true); modes[t.id] = .extendedDisplay } }
+    @objc private func stopWindows() {
+        if airPlayReceiver != nil { stopAirPlay(); return }
+        if let t = target { endWindowMode(showDesktop: true); modes[t.id] = .extendedDisplay }
+    }
 
     @objc private func toggleBlank() {
         capture.blanked.toggle()
         if capture.blanked { output?.videoLayer.contents = nil }
     }
 }
+
+if CommandLine.arguments.contains("--dump-airplay") { AirPlayProbe.run(); exit(0) }
 
 // `WirePlay --preview out.png` renders the chooser to an image (for checking the UI without a display).
 if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--preview" { MainActor.assumeIsolated {

@@ -1300,20 +1300,34 @@ final class AirPlayBrowser: ObservableObject {
     private var browser: NWBrowser?
     private let ownName = Host.current().localizedName ?? ""
 
+    /// Same idea as macOS's own Screen Mirroring list: TVs and Apple TVs, not speakers or other Macs.
+    /// Receivers whose details haven't arrived yet are kept.
+    static func canShowScreen(_ txt: NWTXTRecord) -> Bool {
+        if let model = txt["model"], model.hasPrefix("Mac") || model.hasPrefix("iMac") { return false } // another Mac
+        // "features" is a bit field; bit 7 means the receiver accepts a screen (audio-only
+        // speakers such as a Sonos Amp don't have it).
+        if let features = txt["features"]?.split(separator: ",").first,
+           let bits = UInt64(features.replacingOccurrences(of: "0x", with: ""), radix: 16) {
+            return bits & (1 << 7) != 0
+        }
+        return true
+    }
+
     func start() {
         guard browser == nil else { return }
-        let b = NWBrowser(for: .bonjour(type: "_airplay._tcp", domain: nil), using: .tcp)
+        let b = NWBrowser(for: .bonjourWithTXTRecord(type: "_airplay._tcp", domain: nil), using: .tcp)
         b.browseResultsChangedHandler = { [weak self] results, _ in
             let names = results.compactMap { r -> String? in
-                if case let .service(name, _, _, _) = r.endpoint { return name }
-                return nil
+                guard case let .service(name, _, _, _) = r.endpoint else { return nil }
+                if case let .bonjour(txt) = r.metadata, !AirPlayBrowser.canShowScreen(txt) { return nil }
+                return name
             }
             DispatchQueue.main.async {
                 guard let self else { return }
-                let first = self.receivers.isEmpty
-                self.receivers = Array(Set(names)).filter { $0 != self.ownName }
+                let updated = Array(Set(names)).filter { $0 != self.ownName }
                     .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-                if first && !self.receivers.isEmpty { log("AirPlay: found \(self.receivers.count) receivers") }
+                if updated != self.receivers { log("AirPlay receivers: \(updated.joined(separator: ", "))") }
+                self.receivers = updated
             }
         }
         b.stateUpdateHandler = { state in if case .failed(let e) = state { log("AirPlay browse failed: \(e)") } }

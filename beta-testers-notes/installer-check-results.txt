@@ -1,0 +1,3 @@
+CONFIRMED build.sh copy failure loses existing app: exit=99, old_app_preserved=False, new_app_installed=False
+CONFIRMED install.sh successful rollback preserves existing app: exit=1, old_app_preserved=True, new_app_installed=False
+CONFIRMED install.sh failed rollback cleanup loses backup: exit=99, old_app_preserved=False, new_app_installed=False

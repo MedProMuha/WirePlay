@@ -1,0 +1,21 @@
+# Beta testers notes for PR #2
+
+Ben, I reviewed the AirPlay branch at `0b45184` before installing it. The ARM64 app and Control Center extension build on my Mac. I haven't connected a TV yet, so the items below are source findings and small isolated reproductions, not claims about a completed TV test.
+
+The first things I'd fix:
+
+1. **Keep the black cover until AirPlay actually disconnects.** Stop currently removes it before the async disconnect. The disconnect driver ignores click failures and never verifies that the display went away. The macOS sharing-stop callback and app Quit also leave AirPlay connected. Switching presentation targets can leave the previous receiver connected and mix up receiver/target state. References: `Sources/main.swift:1499`, `1618`, `1668`, `1823`, `1863`, `2008`, `2122`.
+2. **Only confirm a verified Extended Display selection.** The show-mode handler continues to the default button when selecting Extended Display fails. It also doesn't match the sheet to the requested receiver. Cover/setup failure and late connections need rollback. References: `main.swift:1457`, `1465`, `1842`, `1854`, `1971`.
+3. **Make Cancel cancel the attempt.** It currently only closes the picker. Use an attempt ID so an old timer/error cannot cancel a newer retry to the same TV. I reproduced both state problems with extracted Swift logic. References: `main.swift:1802`, `1827`, `1837`.
+4. **Put the active AirPlay session in the presentation controls.** The menu filters out virtual displays, so it omits Blank Screen and Add or Remove Windows for AirPlay and can show “No external display connected.” The separate AirPlay section only adds Stop. References: `main.swift:2200`, `2214`, `2233`.
+5. **Tighten receiver matching.** The virtual-display fallback accepts a newly connected Sidecar iPad. An already-connected AirPlay TV has the opposite problem: it is ignored because its display ID is already known. Both predicates reproduced in isolated checks. References: `main.swift:1449`, `1726`.
+6. **Finish the async selection protection.** The generation guard covers mode changes but not a new window selection in the same session. Old selection work can replace newer work, and a stale stream-start failure still calls `onFailed`. This predates the AirPlay PR. References: `main.swift:903`, `921`, `957`, `2065`.
+7. **Give discovery failure a visible retry state.** It currently logs failure and leaves the user watching the scanning spinner. Capture-error retry also excludes AirPlay targets. References: `main.swift:1333`, `1553`, `1629`.
+
+Two installer failure tests also reproduced problems: `build.sh:129` deletes the existing app before a replacement copy succeeds, and `install.sh:22` deletes the backup if the rollback move at line 48 fails. The normal rollback case passed. `install.sh:26` should also require the checksum instead of silently skipping it when the asset is absent.
+
+One build detail from this Mac: the Desktop build acquired Finder/file-provider metadata and failed strict signature verification. A clean staged copy outside Desktop passed. I would verify the final installed app, not just the build step.
+
+The local interactive skin prototype includes window search/refresh, readable titles, keyboard-operable selection, a compact presenter panel with an outgoing preview, and always-visible Blank/Stop. These still need native implementation. The preview should be labeled as outgoing content, not proof of what the TV displays. Freeze frame is demonstrated in the prototype and remains a separate native enhancement. “Audio not included” would make current capture behavior clearer.
+
+The earlier beta notes' chooser queue, capture-rate/thumbnail limits, window rescue, log rotation, and wired reconnect improvements are present. I would keep those. Five extracted state checks and three safe installer cases ran; none connected a TV or touched the installed app. Native app source is unchanged. The complete HTML/CSS/JavaScript skin prototype is included in `visual-preview.html`, together with an image, all 16 runnable prototype checks, and the isolated Swift and installer checks. See `README.md` for the implemented prototype improvements and the native work still pending.

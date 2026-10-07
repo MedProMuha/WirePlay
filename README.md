@@ -32,6 +32,19 @@ While you're showing windows:
 - **Stray windows come back.** Any window that ends up on the TV is moved back to your Mac. This needs Accessibility permission, which you grant from Settings.
 - **Add or remove windows at any time** from the menu bar icon or the Control Center button. **Blank Screen** hides everything for a moment.
 
+## AirPlay (new in 1.1, beta)
+
+WirePlay can also present to **AirPlay TVs and Apple TVs**, with the same controls:
+
+1. Click the WirePlay menu bar icon › **AirPlay to** › pick a TV (or **Choose…**). With nothing plugged in, the Control Center button opens the same list.
+2. WirePlay connects through macOS's Screen Mirroring menu, as an extended display.
+3. The TV turns black and WirePlay's window grid opens: pick the windows to show. **Add or Remove Windows**, **Blank Screen** and the pointer fence all work as they do over HDMI.
+4. **Stop AirPlay to "…"** in the menu disconnects. Cancelling the window grid also disconnects, so your desktop is never left showing on the TV.
+
+The list only shows receivers that can show a screen (TVs and Apple TVs), not speakers such as Sonos or other people's Macs.
+
+macOS has no public way for apps to start AirPlay, so WirePlay clicks through the Screen Mirroring menu for you. This needs **Accessibility** permission. If a future macOS changes that menu, this part may need an update. `open -n -a WirePlay --args --dump-airplay` writes what WirePlay sees to `~/Library/Logs/WirePlay-airplay-ax.txt` for troubleshooting.
+
 ## Remembering monitors
 
 WirePlay remembers every monitor it sees, by make, model and serial number. Each one gets a rule for when it's connected: **Ask Every Time**, **Mirror**, **Window or App**, **Extended**, or **Ignore** (leave it to macOS, for example your desk monitor). You can also rename a monitor, for example "Conference Room TV".
@@ -49,7 +62,8 @@ Open Control Center, click **Edit Controls**, search for **WirePlay**, and drag 
 ## Permissions
 
 - **Screen Recording.** Needed for the Window or App grid (to list windows and show previews) and for drawing the shared windows on the TV. WirePlay asks the first time you use it. Turn it on under *System Settings › Privacy & Security › Screen & System Audio Recording*.
-- **Accessibility** (optional). Needed only to move stray windows back off the TV. Grant it from WirePlay's Settings.
+- **Accessibility.** Needed to start AirPlay, and to move stray windows back off the TV. Grant it from WirePlay's Settings. Not needed for HDMI on its own.
+- **Local Network.** macOS asks once, so WirePlay can find AirPlay TVs on your network.
 
 Mirroring and Extended Display need no permissions. If you'd rather not grant Screen Recording, Settings can switch Window or App to the macOS window picker, which doesn't need it. Its hover buttons can be hard to click when you have many windows open, though.
 

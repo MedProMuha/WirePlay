@@ -33,6 +33,10 @@ The production request-state checks exercise attempt identity, cancellation owne
 
 The ARM64 app and Control Center extension build. Independent review covered native lifecycle/ownership, the installer, and the Python test; follow-up findings were corrected. Gitleaks found no secrets in the changed source. The browser prototype's 16 checks remain separate from native verification.
 
+The native build from commit `dc1ef27` was installed locally on October 8, 2026. The installed executable matches the built executable's SHA-256 and passes strict signature verification. The previous app was backed up before replacement. Launch and the receiver chooser's empty and refreshing states were checked through the installed app. No receiver was connected during this check.
+
+Live chooser controls were verified through accessibility state. The automation tool returned an all-white window capture, so that capture is inconclusive for live visual appearance; the native render above is the visual evidence available. A direct on-screen appearance check remains open.
+
 The old `state-checks.swift` and `installer-check.py` in this folder are historical reproductions at `0b45184`; the installer extraction expects that old checkout. Use the new `tests/` commands for current code.
 
 ## Limits still requiring physical testing

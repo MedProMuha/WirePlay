@@ -1,5 +1,7 @@
 # Beta testers notes for PR #2
 
+> Historical pre-install audit. Native fixes and current verification are described in [NATIVE_IMPLEMENTATION.md](NATIVE_IMPLEMENTATION.md).
+
 Ben, I reviewed the AirPlay branch at `0b45184` before installing it. The ARM64 app and Control Center extension build on my Mac. I haven't connected a TV yet, so the items below are source findings and small isolated reproductions, not claims about a completed TV test.
 
 The first things I'd fix:

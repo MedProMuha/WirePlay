@@ -1,8 +1,10 @@
 # Beta testers notes
 
+**Update: the native implementation is now included. Start with [NATIVE_IMPLEMENTATION.md](NATIVE_IMPLEMENTATION.md) for the changes, current tests, and remaining hardware limitations.** The rest of this page records the original prototype handoff.
+
 Review and design handoff for Ben, October 7, 2026. Based on the `airplay` branch at `0b45184dfe0cead28c211bb425effdd162a61a95` ([PR #2](https://github.com/ben-medpro/WirePlay/pull/2)).
 
-**This is an audit and working design prototype, not a patched native app.** The branch contains the complete original app source plus this folder. `Sources/`, `Controls/`, installers, project files, and main README are unchanged. No native bug fix, installation, or physical AirPlay test is claimed.
+**Original handoff scope (superseded by the native follow-up above):** This was an audit and working design prototype, not a patched native app. The branch contains the complete original app source plus this folder. `Sources/`, `Controls/`, installers, project files, and main README are unchanged. No native bug fix, installation, or physical AirPlay test is claimed.
 
 ## Start here
 

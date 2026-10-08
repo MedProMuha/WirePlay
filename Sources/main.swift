@@ -17,6 +17,7 @@
 import Cocoa
 import Combine
 import CoreMedia
+import CoreImage
 import Network
 @preconcurrency import ScreenCaptureKit
 import ServiceManagement
@@ -292,7 +293,7 @@ struct ExternalDisplay: Equatable {
     /// macOS names an AirPlay display "<receiver> (AirPlay)", e.g. "Mike-Office (AirPlay)".
     var airPlayReceiver: String? {
         let n = hardwareName
-        return n.hasSuffix(" (AirPlay)") ? String(n.dropLast(" (AirPlay)".count)) : nil
+        return AirPlayAttempt.receiver(in: n)
     }
 
     var hardwareName: String {
@@ -620,6 +621,10 @@ final class WindowPickerModel: ObservableObject {
     @Published var selected: Set<CGWindowID>
     @Published var loading = true
     @Published var failure: String?
+    @Published var completedThumbnailIDs: Set<CGWindowID> = []
+    var onRefresh: () -> Void = {}
+    var isEditing = false
+    private var loadRevision = 0
     let displayName: String
     var onDone: ([SCWindow]?) -> Void = { _ in }   // nil = cancelled
     var onUseSystemPicker: () -> Void = {}
@@ -646,8 +651,12 @@ final class WindowPickerModel: ObservableObject {
     /// Lists shareable windows, front-most first, then fills in thumbnails.
     @MainActor
     func load(excludingBundleIDs excluded: Set<String>, excludingArea tv: CGRect?) async {
+        loadRevision += 1
+        let revision = loadRevision
+        loading = true; failure = nil; thumbs = [:]; completedThumbnailIDs = []
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+            guard revision == loadRevision else { return }
             // CGWindowList is ordered front to back; use it to put recently used windows first.
             let order = ((CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]) ?? [])
                 .enumerated().reduce(into: [CGWindowID: Int]()) { map, e in
@@ -669,6 +678,7 @@ final class WindowPickerModel: ObservableObject {
             selected = selected.intersection(Set(items.map(\.id)))
             loading = false
         } catch {
+            guard revision == loadRevision else { return }
             log("window list failed: \(error)")
             failure = error.localizedDescription
             loading = false
@@ -680,6 +690,8 @@ final class WindowPickerModel: ObservableObject {
         await withTaskGroup(of: (CGWindowID, NSImage?).self) { group in
             for _ in 0..<4 { if let w = queue.next() { group.addTask { await Self.thumbnail(of: w) } } }
             for await (id, image) in group {
+                guard revision == loadRevision else { group.cancelAll(); return }
+                completedThumbnailIDs.insert(id)
                 if let image { thumbs[id] = image }
                 if let w = queue.next() { group.addTask { await Self.thumbnail(of: w) } }
             }
@@ -855,6 +867,10 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private let queue = DispatchQueue(label: "WirePlay.frames", qos: .userInteractive)
     weak var window: OutputWindow?
     var blanked = false { didSet { if blanked { window?.cursorLayer.isHidden = true } } }
+    var frozen = false { didSet { if frozen { window?.cursorLayer.isHidden = true } } }
+    var onPreview: (NSImage?) -> Void = { _ in }
+    private let previewContext = CIContext(options: [.cacheIntermediates: false])
+    private var lastPreview: TimeInterval = 0
     var onStopped: () -> Void = {}
     var onFailed: (Error) -> Void = { _ in }
 
@@ -899,17 +915,14 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         }
         loggedFrame = false
         log("filter style=\(filter.style.rawValue) rect=\(filter.contentRect) → \(config.width)x\(config.height); windows=\(sharedWindowIDs.count) apps=\(sharedPIDs.count)")
-        startCursorWatch()
-        if let stream {
-            Task {
-                do { try await stream.updateContentFilter(filter); try await stream.updateConfiguration(config) }
-                catch { log("update failed: \(error)") }
-            }
-            return
-        }
+        // A new stream for each explicit selection serializes filter/config changes by identity.
+        // Old starts, frames, and failures are ignored once this stream is replaced.
+        stop(clearOutput: false)
+        if !blanked && !frozen { window?.setPlaceholder("Updating selection…"); onPreview(nil) }
         let s = SCStream(filter: filter, configuration: config, delegate: self)
-        do { try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue) } catch { log("addStreamOutput: \(error)"); return }
+        do { try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue) } catch { onFailed(error); return }
         stream = s
+        startCursorWatch()
         SCContentSharingPicker.shared.setConfiguration(PickerSetup.configuration, for: s)
         Task {
             do {
@@ -918,19 +931,17 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                 DispatchQueue.main.async { if self.stream !== s { Task { try? await s.stopCapture() }; log("dropped a capture that was replaced while starting") } }
             } catch {
                 log("startCapture failed: \(error)")
-                DispatchQueue.main.async { if self.stream === s { self.stream = nil }; self.onFailed(error) }
+                DispatchQueue.main.async { guard self.stream === s else { return }; self.stream = nil; self.onFailed(error) }
             }
         }
     }
 
-    func stop() {
+    func stop(clearOutput: Bool = true) {
         cursorTimer?.invalidate(); cursorTimer = nil
         window?.cursorLayer.isHidden = true
         screenRect = .null
-        guard let s = stream else { return }
-        stream = nil
-        Task { try? await s.stopCapture() }
-        DispatchQueue.main.async { self.window?.setPlaceholder("Waiting for content…") }
+        if let s = stream { stream = nil; Task { try? await s.stopCapture() } }
+        if clearOutput { window?.setPlaceholder(nil); window?.videoLayer.contents = nil; onPreview(nil) }
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -955,19 +966,29 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         let screen = (info[.screenRect] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0) } ?? .null
 
         DispatchQueue.main.async { [weak self] in
-            guard let self, let window = self.window else { return }
+            guard let self, self.stream === stream, let window = self.window else { return }
             if !self.loggedFrame {
                 self.loggedFrame = true
                 log("frame \(Int(W))x\(Int(H)) contentRect=\(content.map { "\($0)" } ?? "nil") scale=\(scale) screenRect=\(screen)")
             }
             self.screenRect = screen
             self.contentSize = size
-            guard !self.blanked else { return }
+            guard !self.blanked, !self.frozen else { return }
             CATransaction.begin(); CATransaction.setDisableActions(true)
             window.videoLayer.contents = surface
             window.videoLayer.contentsRect = crop
             CATransaction.commit()
             window.setPlaceholder(nil)
+            let now = Date.timeIntervalSinceReferenceDate
+            if now - self.lastPreview >= 0.5 {
+                self.lastPreview = now
+                let source = CIImage(cvPixelBuffer: pixels)
+                let rect = CGRect(x: crop.minX * W, y: (1 - crop.maxY) * H, width: crop.width * W, height: crop.height * H)
+                let image = source.cropped(to: rect).transformed(by: CGAffineTransform(scaleX: min(1, 720 / max(rect.width, 1)), y: min(1, 720 / max(rect.width, 1))))
+                if let cg = self.previewContext.createCGImage(image, from: image.extent) {
+                    self.onPreview(NSImage(cgImage: cg, size: .zero))
+                }
+            }
         }
     }
 
@@ -995,7 +1016,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         if tick % 6 == 0 { overShared = pointerIsOverSharedContent() } // window list 10×/s; the pointer itself still moves at 60
         tick += 1
 
-        guard overShared, !blanked, !screenRect.isNull, screenRect.width > 0, contentSize.width > 0,
+        guard overShared, !blanked, !frozen, !screenRect.isNull, screenRect.width > 0, contentSize.width > 0,
               let p = CGEvent(source: nil)?.location, screenRect.contains(p) else {
             if !layer.isHidden { CATransaction.begin(); CATransaction.setDisableActions(true); layer.isHidden = true; CATransaction.commit() }
             return
@@ -1049,7 +1070,7 @@ enum PickerSetup {
         var c = SCContentSharingPickerConfiguration()
         // No display modes: picking the external display itself would show its empty desktop.
         c.allowedPickerModes = [.singleWindow, .multipleWindows, .singleApplication, .multipleApplications]
-        c.allowsChangingSelectedContent = true
+        c.allowsChangingSelectedContent = false
         c.excludedBundleIDs = excludedApps()
         log("picker excludes \(c.excludedBundleIDs.joined(separator: ", "))")
         return c
@@ -1297,6 +1318,8 @@ enum AirPlayProbe {
 /// opening Control Center.
 final class AirPlayBrowser: ObservableObject {
     @Published private(set) var receivers: [String] = []
+    @Published private(set) var failure: String?
+    @Published private(set) var searching = true
     private var browser: NWBrowser?
     private let ownName = Host.current().localizedName ?? ""
 
@@ -1315,6 +1338,7 @@ final class AirPlayBrowser: ObservableObject {
 
     func start() {
         guard browser == nil else { return }
+        failure = nil; searching = true
         let b = NWBrowser(for: .bonjourWithTXTRecord(type: "_airplay._tcp", domain: nil), using: .tcp)
         b.browseResultsChangedHandler = { [weak self] results, _ in
             let names = results.compactMap { r -> String? in
@@ -1323,16 +1347,34 @@ final class AirPlayBrowser: ObservableObject {
                 return name
             }
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.browser === b else { return }
+                self.searching = false
                 let updated = Array(Set(names)).filter { $0 != self.ownName }
                     .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
                 if updated != self.receivers { log("AirPlay receivers: \(updated.joined(separator: ", "))") }
                 self.receivers = updated
             }
         }
-        b.stateUpdateHandler = { state in if case .failed(let e) = state { log("AirPlay browse failed: \(e)") } }
-        b.start(queue: .main)
+        b.stateUpdateHandler = { [weak self, weak b] state in
+            guard let self, let b, self.browser === b else { return }
+            switch state {
+            case .failed(let error), .waiting(let error):
+                self.failure = "Discovery unavailable. Check Local Network permission and Wi-Fi. \(error.localizedDescription)"
+                self.searching = false
+            case .ready: self.failure = nil
+            default: break
+            }
+        }
         browser = b
+        b.start(queue: .main)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self, weak b] in
+            guard let self, let b, self.browser === b else { return }
+            self.searching = false
+        }
+    }
+
+    func retry() {
+        browser?.cancel(); browser = nil; receivers = []; start()
     }
 }
 
@@ -1340,13 +1382,16 @@ final class AirPlayBrowser: ObservableObject {
 /// off the main thread.
 enum ScreenMirroring {
     enum Failure: LocalizedError {
-        case notTrusted, listNotFound, receiverNotFound(String), pressFailed
+        case notTrusted, listNotFound, receiverNotFound(String), pressFailed, cancelled, modeNotVerified, disconnectNotVerified
         var errorDescription: String? {
             switch self {
             case .notTrusted: return "WirePlay needs Accessibility permission to start AirPlay."
             case .listNotFound: return "Couldn’t open the Screen Mirroring list."
             case .receiverNotFound(let n): return "“\(n)” isn’t in the Screen Mirroring list right now."
             case .pressFailed: return "macOS didn’t accept the click."
+            case .cancelled: return "The connection was cancelled."
+            case .modeNotVerified: return "Could not verify Extended Display for this receiver. The connection will be stopped."
+            case .disconnectNotVerified: return "Could not confirm that AirPlay stopped. The display cover will stay in place. Retry Stop or disconnect in Control Center."
             }
         }
     }
@@ -1441,47 +1486,51 @@ enum ScreenMirroring {
 
     /// Starts AirPlay to `name` and asks for an extended display. Returns once macOS has been
     /// told; the display itself shows up a few seconds later.
-    static func connect(_ name: String) throws {
+    static func connect(_ attempt: AirPlayAttempt) throws {
+        func check() throws { if attempt.isCancelled { throw Failure.cancelled } }
+        try check()
         guard AXIsProcessTrusted() else { throw Failure.notTrusted }
         let w = try openList()
         defer { close() }
-        guard let d = device(named: name, in: w) else { throw Failure.receiverNotFound(name) }
-        if d.on { log("AirPlay: \(name) already connected"); return }
-        guard AX.press(d.toggle) else { throw Failure.pressFailed }
-        log("AirPlay: asked macOS to connect to \(name)")
-        answerShowSheet(for: name)
+        try check()
+        guard let d = device(named: attempt.name, in: w) else { throw Failure.receiverNotFound(attempt.name) }
+        guard attempt.beginRequest() else { throw Failure.cancelled }
+        if !d.on {
+            guard AX.press(d.toggle) else { throw Failure.pressFailed }
+            try check()
+            try answerShowSheet(for: attempt)
+        }
+        try check()
     }
 
-    /// macOS may ask "What do you want to show on …?" (unless a default is set for that
-    /// receiver). Pick Extended Display; WirePlay then shows only the chosen windows on it.
-    private static func answerShowSheet(for name: String) {
+    /// Never confirm a default whose selected mode or receiver is unknown.
+    private static func answerShowSheet(for attempt: AirPlayAttempt) throws {
         var sheet: AXUIElement?
-        let appeared = wait(6) {
+        _ = wait(6) {
+            if attempt.isCancelled { return true }
             sheet = allWindows().first { w in
                 AX.first(in: w) { el in AX.labels(el).contains { $0.contains("What do you want to show") } } != nil
             }
             return sheet != nil
         }
-        guard appeared, let sheet else { log("AirPlay: no 'What do you want to show' sheet (a default may be set)"); return }
-        log("AirPlay sheet:\n" + AX.dump(sheet, maxNodes: 200))
-        if let card = AX.first(in: sheet, where: { el in AX.labels(el).contains { $0 == "Extended Display" } && AX.press(el) }) {
-            _ = card
-            Thread.sleep(forTimeInterval: 0.4)
-        } else {
-            log("AirPlay: Extended Display option not found in the sheet")
+        guard !attempt.isCancelled else { throw Failure.cancelled }
+        // A saved mode can bypass this sheet. AppDelegate must still unmirror and verify it.
+        guard let sheet else { return }
+        guard AX.first(in: sheet, where: { el in
+            AX.labels(el).contains { $0.contains(attempt.name) }
+        }) != nil else { throw Failure.modeNotVerified }
+        guard let card = AX.first(in: sheet, where: { el in AX.labels(el).contains("Extended Display") }),
+              AX.press(card) else { throw Failure.modeNotVerified }
+        var confirm: AXUIElement?
+        _ = wait(1.5) {
+            if attempt.isCancelled { return true }
+            confirm = AX.first(in: sheet) { el in
+                AX.role(el) == kAXButtonRole && AX.labels(el).contains { $0 == "Use as Extended Display" }
+            }
+            return confirm != nil
         }
-        // Confirm with the sheet's default button ("Use as Extended Display" or similar).
-        if let def = AX.attribute(sheet, kAXDefaultButtonAttribute), CFGetTypeID(def) == AXUIElementGetTypeID() {
-            AX.press(def as! AXUIElement)
-            log("AirPlay: confirmed the sheet")
-        } else if let button = AX.first(in: sheet, where: { el in
-            AX.role(el) == kAXButtonRole && AX.labels(el).contains { $0.localizedCaseInsensitiveContains("extend") }
-        }) {
-            AX.press(button)
-            log("AirPlay: confirmed the sheet (\(AX.labels(button)))")
-        } else {
-            log("AirPlay: couldn't find the sheet's confirm button")
-        }
+        guard !attempt.isCancelled else { throw Failure.cancelled }
+        guard let confirm, AX.press(confirm) else { throw Failure.modeNotVerified }
     }
 
     /// Windows of every app that might host the AirPlay sheet.
@@ -1501,14 +1550,18 @@ enum ScreenMirroring {
         let w = try openList()
         defer { close() }
         guard let d = device(named: name, in: w) else { throw Failure.receiverNotFound(name) }
+        if !d.on { return }
         if let stop = AX.first(in: w, where: { el in
             AX.role(el) == kAXButtonRole && AX.identifier(el) == d.id && (AX.string(el, kAXDescriptionAttribute) ?? "").contains("Stop")
         }) {
-            AX.press(stop)
-        } else if d.on {
-            AX.press(d.toggle)
+            guard AX.press(stop) else { throw Failure.pressFailed }
+        } else {
+            guard AX.press(d.toggle) else { throw Failure.pressFailed }
         }
-        log("AirPlay: disconnected \(name)")
+        guard wait(5, until: {
+            devices(in: w).first(where: { $0.name == name }).map { !$0.on } == true
+        }) else { throw Failure.disconnectNotVerified }
+        log("AirPlay: receiver reports disconnected")
     }
 }
 
@@ -1568,9 +1621,19 @@ struct AirPlayPickerView: View {
     }
 }
 
+// A short-lived observer owns one picker presentation. Removing it also invalidates queued callbacks.
+final class SystemPickerObserver: NSObject, SCContentSharingPickerObserver {
+    var onUpdate: (SCContentFilter, SCStream?) -> Void = { _, _ in }
+    var onCancel: (SCStream?) -> Void = { _ in }
+    var onFailure: (Error) -> Void = { _ in }
+    func contentSharingPicker(_ picker: SCContentSharingPicker, didUpdateWith filter: SCContentFilter, for stream: SCStream?) { onUpdate(filter, stream) }
+    func contentSharingPicker(_ picker: SCContentSharingPicker, didCancelFor stream: SCStream?) { onCancel(stream) }
+    func contentSharingPickerStartDidFailWithError(_ error: Error) { onFailure(error) }
+}
+
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCContentSharingPickerObserver {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let store = Store.shared
     private var known = Set<CGDirectDisplayID>()
@@ -1599,7 +1662,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
     private let airPlayQueue = DispatchQueue(label: "WirePlay.airplay")
     private var airPlayPicker: NSPanel?
     private var airPlayPickerModel: AirPlayPickerModel?
-    private var pendingAirPlay: (name: String, until: Date)? // asked macOS to connect; display not here yet
+    private var pendingAirPlay: AirPlayAttempt?
+    private var airPlayAttempt: AirPlayAttempt?
+    private var airPlayDisplayID: CGDirectDisplayID?
+    private var stoppingAirPlay = false
+    private var disconnectID: UUID?
+    private var terminationPending = false
+    private var cancelledReceivers: [String: Date] = [:]
+    private var lateCovers: [String: OutputWindow] = [:]
+    private var lateDisplayIDs: [String: CGDirectDisplayID] = [:]
+    private var lateDisconnecting: Set<String> = []
+    private var disconnectDriverFinished = false
+    private var cancellationRedriven = false
+    private let presenter = PresenterModel()
+    private var presenterPanel: NSPanel?
+    private var systemPickerObserver: SystemPickerObserver?
+    private var systemPickerID: UUID?
     private var airPlayReceiver: String?                       // receiver behind the current target
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -1611,13 +1689,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
         let picker = SCContentSharingPicker.shared
         picker.defaultConfiguration = PickerSetup.configuration
         picker.maximumStreamCount = 1
-        picker.add(self)
         // Only active while presenting: an active picker puts macOS's green screen-sharing
         // indicator in the menu bar.
 
+        presenter.onChange = { [weak self] in self?.presentPicker() }
+        presenter.onBlank = { [weak self] in self?.toggleBlank() }
+        presenter.onFreeze = { [weak self] in self?.toggleFreeze() }
+        presenter.onStop = { [weak self] in self?.stopWindows() }
+        presenter.onRetry = { [weak self] in self?.stopOwnedAirPlay() }
+        capture.onPreview = { [weak self] image in self?.presenter.preview = image }
         capture.onStopped = { [weak self] in self?.endWindowMode(showDesktop: false) }
         capture.onFailed = { [weak self] error in
             let failed = self?.target
+            let receiver = self?.airPlayReceiver
             self?.endWindowMode(showDesktop: true)
             let a = NSAlert()
             a.messageText = "macOS didn’t allow WirePlay to show that window"
@@ -1626,8 +1710,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             NSApp.activate(ignoringOtherApps: true)
             switch a.runModal() {
             case .alertFirstButtonReturn:
-                let online = ExternalDisplay.online().filter { !$0.isVirtual }
-                if let d = online.first(where: { $0 == failed }) ?? online.first { self?.apply(.windowOrApp, to: d) }
+                if let receiver { self?.connectAirPlay(receiver) }
+                else if let d = ExternalDisplay.online().first(where: { $0 == failed }) { self?.apply(.windowOrApp, to: d) }
             case .alertSecondButtonReturn:
                 NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
             default: break
@@ -1665,6 +1749,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
         catch { log("login item: \(error)") }
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if !lateDisplayIDs.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "A cancelled AirPlay receiver is still being disconnected"
+            alert.informativeText = "Keep WirePlay open to retain its cover. Disconnect that receiver in Control Center before quitting."
+            alert.runModal()
+            return .terminateCancel
+        }
+        guard airPlayAttempt != nil || airPlayReceiver != nil else { return .terminateNow }
+        terminationPending = true
+        stopOwnedAirPlay()
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ note: Notification) {
         fence.stop()
         capture.stop()
@@ -1673,7 +1771,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
 
     // Reopening the app (double-click in Finder) opens Settings.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        showSettings()
+        if target != nil { showPresenter() } else { showAirPlayPicker() }
         return false
     }
 
@@ -1702,6 +1800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
     // MARK: Display tracking
 
     func scheduleRescan() {
+        if airPlayAttempt != nil || airPlayReceiver != nil { rescan(); return }
         guard !rescanPending else { return }
         rescanPending = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.rescanPending = false; self?.rescan() }
@@ -1711,9 +1810,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
         let displays = ExternalDisplay.online()
         let ids = Set(displays.map(\.id))
 
+        cancelledReceivers = cancelledReceivers.filter { $0.value > Date() }
+        for (name, id) in lateDisplayIDs where !ids.contains(id) && !displays.contains(where: { $0.airPlayReceiver == name }) {
+            lateCovers.removeValue(forKey: name)?.orderOut(nil)
+            lateDisplayIDs[name] = nil; lateDisconnecting.remove(name)
+        }
+        for late in displays {
+            guard let name = late.airPlayReceiver, cancelledReceivers[name] != nil, name != airPlayAttempt?.name else { continue }
+            protectLateReceiver(late, name: name)
+        }
+        if let attempt = airPlayAttempt, attempt.ownsConnection,
+           let display = displays.first(where: { attempt.matches(receiver: $0.airPlayReceiver) }) {
+            if attempt.isCancelled {
+                coverAirPlay(display, name: attempt.name)
+                if stoppingAirPlay && disconnectDriverFinished && !cancellationRedriven {
+                    cancellationRedriven = true
+                    airPlayQueue.async {
+                        do { try ScreenMirroring.disconnect(attempt.name) }
+                        catch { log("Late cancellation disconnect will require retry: \(error.localizedDescription)") }
+                    }
+                }
+            }
+            else if pendingAirPlay === attempt { airPlayConnected(attempt.name, display: display) }
+        }
         if let t = target {
             if !ids.contains(t.id) {
-                if airPlayReceiver != nil { log("AirPlay display went away"); airPlayReceiver = nil; endWindowMode(showDesktop: false) }
+                if airPlayReceiver != nil { if !stoppingAirPlay { stopOwnedAirPlay() } }
                 else if lostKey == nil && capture.stream != nil { beginGrace(for: t) }
                 else if lostKey == nil { log("presenting display gone"); endWindowMode(showDesktop: false) }
             } else if let screen = t.screen { output?.fit(to: screen); updateFence() }
@@ -1725,12 +1847,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
 
         for d in displays where !known.contains(d.id) {
             log("connected \(d.name) id=\(d.id) key=\(d.key) mirrored=\(d.isMirrored)")
-            // The receiver we just asked macOS to AirPlay to. Match it by name; fall back to the
-            // first new virtual display in case macOS names it differently.
-            if let pending = pendingAirPlay, Date() < pending.until,
-               d.airPlayReceiver == pending.name || (d.airPlayReceiver == nil && d.isVirtual) {
-                airPlayConnected(pending.name, display: d); continue
-            }
             if d.isVirtual { continue }
             if let lostKey, d.key == lostKey { resume(on: d); continue }
             let rule = store.rule(for: d.key)
@@ -1782,15 +1898,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
     @objc func showAirPlayPicker() {
         airPlayPicker?.close()
         let model = AirPlayPickerModel(browser: airPlay)
+        model.connecting = pendingAirPlay?.name
         let panel = NSPanel(contentRect: .zero, styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
         panel.isMovableByWindowBackground = true
         panel.level = .floating
         panel.isReleasedWhenClosed = false
-        panel.contentView = NSHostingView(rootView: AirPlayPickerView(model: model))
+        panel.contentView = NSHostingView(rootView: SkinnedAirPlayPickerView(model: model))
         model.onPick = { [weak self] name in self?.connectAirPlay(name) }
-        model.onCancel = { [weak self] in self?.closeAirPlayPicker() }
+        model.onCancel = { [weak self] in
+            if self?.airPlayAttempt != nil { self?.stopOwnedAirPlay() }
+            self?.closeAirPlayPicker()
+        }
         panel.setContentSize(panel.contentView!.fittingSize)
         place(panel, yOffset: 40)
         airPlayPicker = panel
@@ -1809,6 +1929,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
 
     /// Ask macOS (via the Screen Mirroring list) to AirPlay to `name` as an extended display.
     func connectAirPlay(_ name: String) {
+        guard lateDisplayIDs[name] == nil, !lateDisconnecting.contains(name) else {
+            if airPlayPicker == nil { showAirPlayPicker() }
+            airPlayPickerModel?.error = "This receiver is still being disconnected after a cancelled request. Wait for it to disappear or disconnect it in Control Center before reconnecting."
+            return
+        }
         guard AXIsProcessTrusted() else {
             let a = NSAlert()
             a.messageText = "Allow WirePlay to start AirPlay"
@@ -1820,53 +1945,196 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             }
             return
         }
-        if target != nil { endWindowMode(showDesktop: false) } // one presentation at a time
-        log("AirPlay: connecting to \(name)")
+        guard !stoppingAirPlay else { return }
+        if airPlayAttempt != nil || airPlayReceiver != nil {
+            stopOwnedAirPlay { [weak self] in self?.connectAirPlay(name) }
+            return
+        }
+        if target != nil { finishWindowMode(showDesktop: false) }
+        generation += 1
+        cancelledReceivers[name] = nil
+        let attempt = AirPlayAttempt(name: name)
+        airPlayAttempt = attempt
+        pendingAirPlay = attempt
+        presenter.error = nil
         airPlayPickerModel?.connecting = name
         airPlayPickerModel?.error = nil
-        pendingAirPlay = (name, Date().addingTimeInterval(25))
         airPlayQueue.async { [weak self] in
-            do { try ScreenMirroring.connect(name) }
-            catch {
-                log("AirPlay: \(error.localizedDescription)")
-                DispatchQueue.main.async { self?.airPlayFailed(name, error.localizedDescription) }
+            do {
+                try ScreenMirroring.connect(attempt)
+                DispatchQueue.main.async {
+                    guard let self, self.airPlayAttempt === attempt, !attempt.isCancelled else { return }
+                    self.rescan()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard let self, self.airPlayAttempt === attempt, !attempt.isCancelled else { return }
+                    self.airPlayFailed(attempt, error.localizedDescription)
+                }
             }
         }
-        // If no display turns up, say so instead of waiting forever.
         DispatchQueue.main.asyncAfter(deadline: .now() + 25) { [weak self] in
-            guard let self, self.pendingAirPlay?.name == name else { return }
-            self.airPlayFailed(name, "“\(name)” didn’t connect. Is it on, and on the same network?")
+            guard let self, self.pendingAirPlay === attempt, !attempt.isCancelled else { return }
+            self.airPlayFailed(attempt, "The receiver did not become an identifiable extended display. Check the TV and try again.")
         }
     }
 
-    private func airPlayFailed(_ name: String, _ message: String) {
-        guard pendingAirPlay?.name == name else { return }
-        pendingAirPlay = nil
-        if let model = airPlayPickerModel {
-            model.connecting = nil; model.error = message
-        } else {
-            let a = NSAlert(); a.messageText = "AirPlay to “\(name)” didn’t start"; a.informativeText = message
-            NSApp.activate(ignoringOtherApps: true); a.runModal()
-        }
+    private func airPlayFailed(_ attempt: AirPlayAttempt, _ message: String) {
+        guard airPlayAttempt === attempt else { return }
+        log("AirPlay setup failed: \(message)")
+        presenter.error = message
+        stopOwnedAirPlay()
+        airPlayPickerModel?.connecting = nil
+        airPlayPickerModel?.error = message
     }
 
-    /// The AirPlay display appeared: cover it and open the window grid, like Window or App.
-    private func airPlayConnected(_ name: String, display: ExternalDisplay) {
-        log("AirPlay: \(name) connected as display \(display.id)")
-        pendingAirPlay = nil
+    private func coverAirPlay(_ display: ExternalDisplay, name: String) {
         airPlayNames[display.id] = name
         airPlayReceiver = name
+        airPlayDisplayID = display.id
+        // The identity must survive even while a mirrored display lacks its own NSScreen.
+        target = display
+        guard let screen = display.screen else { return }
+        if output == nil { output = OutputWindow(screen: screen); capture.window = output }
+        output?.fit(to: screen)
+        if airPlayAttempt?.isCancelled == true {
+            capture.blanked = true
+            output?.setPlaceholder(nil)
+            output?.videoLayer.contents = nil
+        }
+        output?.orderFrontRegardless()
+        updateFence()
+    }
+
+    private func airPlayConnected(_ name: String, display: ExternalDisplay) {
+        pendingAirPlay = nil
+        airPlayAttempt?.markConnected()
+        coverAirPlay(display, name: name)
         closeAirPlayPicker()
         apply(.windowOrApp, to: display)
     }
 
-    @objc private func stopAirPlay() {
-        guard let name = airPlayReceiver else { return }
-        airPlayReceiver = nil
-        endWindowMode(showDesktop: false)
-        airPlayQueue.async {
-            do { try ScreenMirroring.disconnect(name) } catch { log("AirPlay: stop failed: \(error.localizedDescription)") }
+    @objc private func stopAirPlay() { stopOwnedAirPlay() }
+
+    private func stopOwnedAirPlay(after: (() -> Void)? = nil) {
+        guard !stoppingAirPlay else { return }
+        guard let name = airPlayReceiver ?? airPlayAttempt?.name else { after?(); return }
+        let attempt = airPlayAttempt
+        attempt?.cancel()
+        generation += 1
+        stoppingAirPlay = true
+        disconnectDriverFinished = false; cancellationRedriven = false
+        let operation = UUID(); disconnectID = operation
+        capture.blanked = true
+        capture.stop()
+        output?.setPlaceholder(nil)
+        output?.videoLayer.contents = nil
+        windowPicker?.close(); windowPicker = nil
+        invalidateSystemPicker()
+        SCContentSharingPicker.shared.isActive = false
+        presenter.destination = name
+        presenter.status = "Output blank"
+        presenter.connection = "Disconnecting…"
+        presenter.isBlank = true; presenter.busy = true
+        showPresenter()
+        airPlayQueue.async { [weak self] in
+            do {
+                // The serial queue lets any in-flight connect finish before rollback.
+                if attempt?.ownsConnection == true || attempt == nil { try ScreenMirroring.disconnect(name) }
+                DispatchQueue.main.async {
+                    self?.disconnectDriverFinished = true
+                    self?.waitForAirPlayDisconnect(name, operation: operation, remaining: 200, quiet: 0, after: after)
+                }
+            } catch {
+                DispatchQueue.main.async { self?.disconnectFailed(error.localizedDescription, operation: operation) }
+            }
         }
+    }
+
+    private func waitForAirPlayDisconnect(_ name: String, operation: UUID, remaining: Int, quiet: Int, after: (() -> Void)?) {
+        guard disconnectID == operation else { return }
+        let present = ExternalDisplay.online().contains { $0.id == airPlayDisplayID || $0.airPlayReceiver == name }
+        // Observe a quiet interval as well as the driver's off state; late displays retain a cover.
+        let canRelease = airPlayAttempt?.canRelease(receiverPresent: present, quiet: quiet >= 10) ?? (!present && quiet >= 10)
+        if canRelease {
+            if airPlayAttempt?.needsLateConnectionWatch == true {
+                cancelledReceivers[name] = Date().addingTimeInterval(120)
+            }
+            if let id = airPlayDisplayID { airPlayNames[id] = nil }
+            airPlayReceiver = nil; airPlayDisplayID = nil
+            pendingAirPlay = nil; airPlayAttempt = nil; disconnectID = nil; stoppingAirPlay = false
+            airPlayPickerModel?.connecting = nil
+            finishWindowMode(showDesktop: false)
+            if terminationPending {
+                terminationPending = false
+                NSApp.reply(toApplicationShouldTerminate: lateDisplayIDs.isEmpty)
+            }
+            else { after?() }
+            return
+        }
+        guard remaining > 0 else {
+            disconnectFailed("The receiver still appears connected. The cover is being kept in place. Retry Stop or disconnect it in Control Center.", operation: operation)
+            return
+        }
+        rescan()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.waitForAirPlayDisconnect(name, operation: operation, remaining: remaining - 1, quiet: present ? 0 : quiet + 1, after: after)
+        }
+    }
+
+    private func disconnectFailed(_ message: String, operation: UUID) {
+        guard disconnectID == operation else { return }
+        stoppingAirPlay = false
+        presenter.busy = false; presenter.error = message
+        presenter.connection = "Disconnection unconfirmed"
+        airPlayPickerModel?.connecting = nil; airPlayPickerModel?.error = message
+        showPresenter()
+        if terminationPending { terminationPending = false; NSApp.reply(toApplicationShouldTerminate: false) }
+    }
+
+    // Late cancelled receivers never borrow the active presentation's output or target.
+    private func protectLateReceiver(_ display: ExternalDisplay, name: String) {
+        lateDisplayIDs[name] = display.id
+        if display.isMirrored { _ = setMirroring(display.id, on: false) }
+        if let screen = display.screen {
+            if lateCovers[name] == nil { lateCovers[name] = OutputWindow(screen: screen) }
+            lateCovers[name]?.setPlaceholder(nil)
+            lateCovers[name]?.fit(to: screen)
+            lateCovers[name]?.orderFrontRegardless()
+        }
+        guard lateDisconnecting.insert(name).inserted else { return }
+        disconnectLateReceiver(name)
+    }
+
+    private func disconnectLateReceiver(_ name: String) {
+        airPlayQueue.async { [weak self] in
+            do {
+                try ScreenMirroring.disconnect(name)
+                DispatchQueue.main.async { self?.checkLateReceiverGone(name, remaining: 50) }
+            } catch {
+                DispatchQueue.main.async { self?.lateReceiverFailed(name, message: error.localizedDescription) }
+            }
+        }
+    }
+
+    private func checkLateReceiverGone(_ name: String, remaining: Int) {
+        guard lateDisplayIDs[name] != nil else { return }
+        if !ExternalDisplay.online().contains(where: { $0.airPlayReceiver == name || $0.id == lateDisplayIDs[name] }) {
+            lateCovers.removeValue(forKey: name)?.orderOut(nil)
+            lateDisplayIDs[name] = nil; lateDisconnecting.remove(name)
+            return
+        }
+        guard remaining > 0 else { lateReceiverFailed(name, message: "The display is still connected."); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in self?.checkLateReceiverGone(name, remaining: remaining - 1) }
+    }
+
+    private func lateReceiverFailed(_ name: String, message: String) {
+        guard lateDisplayIDs[name] != nil else { return }
+        let alert = NSAlert()
+        alert.messageText = "Could not disconnect cancelled receiver “\(name)”"
+        alert.informativeText = "\(message) Its separate cover is being retained. Your current presentation has not been changed."
+        alert.addButton(withTitle: "Retry Disconnect"); alert.addButton(withTitle: "Keep Covered")
+        if alert.runModal() == .alertFirstButtonReturn { disconnectLateReceiver(name) }
     }
 
     /// `queued`: from a new connection. If a chooser or the window grid is already up, wait
@@ -1890,7 +2158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
         panel.isMovableByWindowBackground = true
         panel.level = .floating
         panel.isReleasedWhenClosed = false
-        panel.contentView = NSHostingView(rootView: ChooserView(model: model))
+        panel.contentView = NSHostingView(rootView: SkinnedChooserView(model: model))
         model.onDone = { [weak self, weak panel] result in
             panel?.close()
             guard let self else { return }
@@ -1957,6 +2225,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
     // MARK: Modes
 
     func apply(_ mode: ShowMode, to display: ExternalDisplay) {
+        guard !stoppingAirPlay else { return }
+        if airPlayAttempt != nil || airPlayReceiver != nil {
+            if target != display || mode != .windowOrApp {
+                stopOwnedAirPlay { [weak self] in
+                    if ExternalDisplay.online().contains(display) { self?.apply(mode, to: display) }
+                }
+                return
+            }
+        }
         log("apply \(mode.rawValue) to \(display.name)")
         generation += 1
         modes[display.id] = mode
@@ -1971,6 +2248,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             guard hasOtherScreen(than: display) else {
                 log("Window or App needs another screen; \(display.name) is the only one")
                 modes[display.id] = nil
+                if airPlayReceiver != nil { stopOwnedAirPlay() }
                 let a = NSAlert()
                 a.messageText = "Window or App needs your Mac’s own screen"
                 a.informativeText = "“\(display.name)” is the only screen right now (is the lid closed?). Open the lid, or choose Entire Screen instead."
@@ -1978,12 +2256,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
                 a.runModal()
                 return
             }
-            if !setMirroring(display.id, on: false) { mirroringFailed(display, on: false); return }
+            if !setMirroring(display.id, on: false) { if airPlayReceiver != nil { stopOwnedAirPlay() }; mirroringFailed(display, on: false); return }
             let gen = generation
             waitForScreen(display, attempts: 40) { [weak self] screen in
                 // A newer choice (or a disconnect) since this started: leave it alone.
                 guard let self, gen == self.generation, self.modes[display.id] == .windowOrApp else { return }
-                guard let screen else { log("no NSScreen for \(display.id)"); return }
+                guard let screen, !display.isMirrored else {
+                    log("extended display not available")
+                    if self.airPlayReceiver != nil { self.stopOwnedAirPlay() }
+                    return
+                }
                 self.beginWindowMode(on: display, screen: screen)
             }
         }
@@ -2005,6 +2287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
     }
 
     private func beginWindowMode(on display: ExternalDisplay, screen: NSScreen) {
+        guard !stoppingAirPlay, airPlayAttempt == nil || airPlayDisplayID == display.id else { return }
         if target != display { endWindowMode(showDesktop: false) }
         target = display
         if output == nil {
@@ -2015,14 +2298,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
         output?.fit(to: screen)
         output?.orderFrontRegardless()
         updateFence()
+        updatePresenter()
+        showPresenter()
         presentPicker()
     }
 
     private func presentPicker() {
+        guard !stoppingAirPlay, airPlayAttempt?.isCancelled != true else { return }
         if store.useSystemPicker { presentSystemPicker() } else { showWindowPicker() }
     }
 
     private func showWindowPicker() {
+        invalidateSystemPicker()
         guard let t = target else { return }
         guard CGPreflightScreenCaptureAccess() else { askForScreenRecording(); return }
         windowPicker?.close()
@@ -2033,11 +2320,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
         panel.isMovableByWindowBackground = true
         panel.level = .floating
         panel.isReleasedWhenClosed = false
-        panel.contentView = NSHostingView(rootView: WindowPickerView(model: model))
+        model.isEditing = capture.stream != nil
+        panel.contentView = NSHostingView(rootView: SkinnedWindowPickerView(model: model))
+        let pickerGeneration = generation
         model.onDone = { [weak self, weak panel] windows in
             panel?.close()
             guard let self else { return }
             self.windowPicker = nil
+            guard self.target == t, self.generation == pickerGeneration, !self.stoppingAirPlay else { return }
             defer { self.showNextChooserSoon() }
             guard let windows, !windows.isEmpty else {
                 log("window chooser cancelled")
@@ -2057,12 +2347,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
 
         let excluded = Set(PickerSetup.excludedApps())
         let tv = CGDisplayBounds(t.id)
-        Task { @MainActor in await model.load(excludingBundleIDs: excluded, excludingArea: tv) }
+        model.onRefresh = { [weak model] in
+            Task { @MainActor in await model?.load(excludingBundleIDs: excluded, excludingArea: tv) }
+        }
+        model.onRefresh()
     }
 
     /// One window is captured on its own (it can even be partly covered). Several windows are
     /// shown where they sit on the Mac's screen, like AirPlay does.
     private func share(_ windows: [SCWindow]) {
+        guard target != nil, !stoppingAirPlay, airPlayAttempt?.isCancelled != true else { return }
+        generation += 1
+        invalidateSystemPicker()
+        presenter.sharesApps = false
+        capture.stop(clearOutput: !capture.blanked && !capture.frozen)
+        presenter.windows = windows.map { "\($0.owningApplication?.applicationName ?? "App") · \($0.title ?? "Untitled window")" }
+        updatePresenter()
+        showPresenter()
         log("sharing \(windows.count) window(s): \(windows.map { $0.owningApplication?.applicationName ?? "?" }.joined(separator: ", "))")
         if windows.count == 1 {
             capture.apply(SCContentFilter(desktopIndependentWindow: windows[0]), windows: windows)
@@ -2080,10 +2381,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
                     windows.filter { a.frame.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY)) }.count
                         < windows.filter { b.frame.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY)) }.count
                 } ?? content.displays.first { $0.displayID == home }
-                guard let display else { log("no display for windows"); return }
+                guard let display else {
+                    self.capture.onFailed(NSError(domain: "WirePlay", code: 1, userInfo: [NSLocalizedDescriptionKey: "The selected windows no longer have a source display."]))
+                    return
+                }
                 self.capture.apply(SCContentFilter(display: display, including: windows), windows: windows)
             } catch {
-                log("share failed: \(error)")
+                guard gen == self.generation, self.target == display else { return }
+                self.capture.onFailed(error)
             }
         }
     }
@@ -2109,7 +2414,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
     }
 
     private func presentSystemPicker() {
+        guard let destination = target, !stoppingAirPlay else { return }
+        invalidateSystemPicker()
+        let request = UUID()
+        systemPickerID = request
+        let observer = SystemPickerObserver()
+        let isCurrent: () -> Bool = { [weak self] in
+            guard let self else { return false }
+            return self.systemPickerID == request && self.target == destination && !self.stoppingAirPlay && self.airPlayAttempt?.isCancelled != true
+        }
+        observer.onUpdate = { [weak self] filter, stream in
+            DispatchQueue.main.async {
+                guard let self, isCurrent(), stream == nil || stream === self.capture.stream else { return }
+                self.invalidateSystemPicker()
+                self.generation += 1
+                let apps = filter.includedApplications.map { "\($0.applicationName) (all windows)" }
+                self.presenter.sharesApps = !apps.isEmpty
+                self.presenter.windows = apps + filter.includedWindows.map { "\($0.owningApplication?.applicationName ?? "App") · \($0.title ?? "Untitled window")" }
+                self.capture.apply(filter)
+                self.updatePresenter(); self.showPresenter(); self.showNextChooserSoon()
+            }
+        }
+        observer.onCancel = { [weak self] stream in
+            DispatchQueue.main.async {
+                guard let self, isCurrent(), stream == nil || stream === self.capture.stream else { return }
+                self.invalidateSystemPicker()
+                if self.capture.stream == nil { self.endWindowMode(showDesktop: true) }
+                self.showNextChooserSoon()
+            }
+        }
+        observer.onFailure = { [weak self] error in
+            DispatchQueue.main.async {
+                guard let self, isCurrent() else { return }
+                self.invalidateSystemPicker()
+                self.capture.onFailed(error)
+            }
+        }
+        systemPickerObserver = observer
         let picker = SCContentSharingPicker.shared
+        picker.add(observer)
         let config = PickerSetup.configuration // refreshed each time: which overlay apps are running changes
         picker.defaultConfiguration = config
         if let s = capture.stream { picker.setConfiguration(config, for: s) }
@@ -2119,22 +2462,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
         else { SCContentSharingPicker.shared.present() }
     }
 
+    private func invalidateSystemPicker() {
+        systemPickerID = nil
+        if let observer = systemPickerObserver { SCContentSharingPicker.shared.remove(observer) }
+        systemPickerObserver = nil
+    }
+
     private func endWindowMode(showDesktop: Bool) {
-        // An AirPlay TV left as a bare extended desktop would show your desktop to the room:
-        // disconnect AirPlay instead.
-        if showDesktop, let name = airPlayReceiver {
-            airPlayReceiver = nil
-            airPlayQueue.async {
-                do { try ScreenMirroring.disconnect(name) } catch { log("AirPlay: stop failed: \(error.localizedDescription)") }
-            }
-        }
+        if airPlayAttempt != nil || airPlayReceiver != nil { stopOwnedAirPlay(); return }
+        finishWindowMode(showDesktop: showDesktop)
+    }
+
+    private func finishWindowMode(showDesktop: Bool) {
+        invalidateSystemPicker()
         generation += 1
         graceTimer?.invalidate(); graceTimer = nil
         lostKey = nil
         windowPicker?.close(); windowPicker = nil
         capture.stop()
         SCContentSharingPicker.shared.isActive = false
-        capture.blanked = false
+        capture.blanked = false; capture.frozen = false
+        presenterPanel?.orderOut(nil)
+        presenter.windows = []; presenter.preview = nil; presenter.error = nil; presenter.busy = false
         output?.orderOut(nil)
         output = nil
         capture.window = nil
@@ -2165,39 +2514,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
         }
     }
 
-    // MARK: SCContentSharingPickerObserver (called off the main thread)
-
-    func contentSharingPicker(_ picker: SCContentSharingPicker, didUpdateWith filter: SCContentFilter, for stream: SCStream?) {
-        DispatchQueue.main.async {
-            guard self.target != nil else { return }
-            self.capture.apply(filter)
-            self.showNextChooserSoon()
-        }
-    }
-
-    func contentSharingPicker(_ picker: SCContentSharingPicker, didCancelFor stream: SCStream?) {
-        DispatchQueue.main.async {
-            log("picker cancelled")
-            // Cancelling the first pick backs out of Window or App mode; the display stays extended.
-            if self.capture.stream == nil { self.endWindowMode(showDesktop: true) }
-            self.showNextChooserSoon()
-        }
-    }
-
-    func contentSharingPickerStartDidFailWithError(_ error: Error) {
-        log("picker failed: \(error)")
-        DispatchQueue.main.async {
-            let a = NSAlert(); a.messageText = "Couldn’t open the window picker"; a.informativeText = error.localizedDescription
-            a.runModal()
-            self.endWindowMode(showDesktop: true)
-        }
-    }
-
     // MARK: Menu
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let displays = ExternalDisplay.online().filter { !$0.isVirtual }
+        let displays = ExternalDisplay.online().filter { !$0.isVirtual || $0 == target }
         if displays.isEmpty {
             menu.addItem(disabled("No external display connected"))
             menu.addItem(.separator())
@@ -2210,11 +2531,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
             else if d.isMirrored { state = "Mirroring entire screen" }
             else { state = "Extended display" }
             menu.addItem(disabled("\(d.name) — \(state)"))
-            menu.addItem(item("Change What’s Shown…", #selector(openChooser(_:)), d.id))
+            if d.airPlayReceiver == nil { menu.addItem(item("Change What’s Shown…", #selector(openChooser(_:)), d.id)) }
             if target == d {
                 menu.addItem(item(capture.stream == nil ? "Choose Windows…" : "Add or Remove Windows…", #selector(changeWindows), nil))
                 let blank = item("Blank Screen", #selector(toggleBlank), nil); blank.state = capture.blanked ? .on : .off
                 menu.addItem(blank)
+                menu.addItem(item("Presenter Controls…", #selector(showPresenter), nil))
+                let freeze = item("Freeze Frame", #selector(toggleFreeze), nil); freeze.state = capture.frozen ? .on : .off
+                menu.addItem(freeze)
                 menu.addItem(item("Stop Showing Windows", #selector(stopWindows), nil))
             }
             let whenConnected = NSMenuItem(title: "When Connected", action: nil, keyEquivalent: "")
@@ -2285,21 +2609,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SCCont
     }
 
     @objc private func toggleBlank() {
+        guard target != nil, !stoppingAirPlay, airPlayAttempt?.isCancelled != true else { return }
         capture.blanked.toggle()
-        if capture.blanked { output?.videoLayer.contents = nil }
+        if capture.blanked { output?.setPlaceholder(nil); output?.videoLayer.contents = nil }
+        else { capture.frozen = false }
+        updatePresenter()
     }
+
+    @objc private func toggleFreeze() {
+        guard capture.stream != nil, !capture.blanked, !stoppingAirPlay, airPlayAttempt?.isCancelled != true else { return }
+        capture.frozen.toggle()
+        updatePresenter()
+    }
+
+    private func updatePresenter() {
+        presenter.destination = target?.name ?? airPlayReceiver ?? "WirePlay"
+        presenter.connection = airPlayReceiver == nil ? "Wired display" : "AirPlay connected"
+        presenter.isBlank = capture.blanked
+        presenter.isFrozen = capture.frozen
+        presenter.busy = stoppingAirPlay
+        presenter.stopTitle = airPlayReceiver == nil ? "Stop sharing" : "Stop AirPlay"
+        presenter.status = capture.blanked ? "Output blank" : capture.frozen ? "Frame frozen" : presenter.windows.isEmpty ? "Choose windows" : "Presenting"
+    }
+
+    @objc private func showPresenter() {
+        if presenterPanel == nil {
+            let panel = NSPanel(contentRect: .zero, styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+            panel.title = "WirePlay"; panel.titleVisibility = .hidden; panel.titlebarAppearsTransparent = true
+            panel.isReleasedWhenClosed = false; panel.level = .floating
+            panel.contentView = NSHostingView(rootView: PresenterView(model: presenter))
+            panel.setContentSize(panel.contentView!.fittingSize)
+            presenterPanel = panel
+        }
+        guard let panel = presenterPanel else { return }
+        place(panel, yOffset: 0)
+        panel.orderFrontRegardless()
+    }
+
 }
 
 if CommandLine.arguments.contains("--dump-airplay") { AirPlayProbe.run(); exit(0) }
 
+// Render native AppKit-backed controls too; ImageRenderer omits scroll views and link buttons.
+@MainActor
+func writeNativePreview<V: View>(_ view: V, to path: String) {
+    _ = NSApplication.shared
+    let host = NSHostingView(rootView: view)
+    let size = host.fittingSize
+    let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = host
+    window.orderFrontRegardless()
+    host.layoutSubtreeIfNeeded()
+    RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+    host.displayIfNeeded()
+    if let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+        host.cacheDisplay(in: host.bounds, to: bitmap)
+        if let data = bitmap.representation(using: .png, properties: [:]) {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+    }
+    window.orderOut(nil)
+}
+
 // `WirePlay --preview out.png` renders the chooser to an image (for checking the UI without a display).
 if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--preview" { MainActor.assumeIsolated {
-    let view = ChooserView(model: ChooserModel(displayName: "Conference Room TV", initial: .windowOrApp))
+    let view = SkinnedChooserView(model: ChooserModel(displayName: "Conference Room TV", initial: .windowOrApp))
         .background(Color(nsColor: .windowBackgroundColor))
-    let renderer = ImageRenderer(content: view); renderer.scale = 2
-    if let img = renderer.nsImage, let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) {
-        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
-    }
+    writeNativePreview(view, to: CommandLine.arguments[2])
+    exit(0)
+} }
+
+if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--preview-presenter" { MainActor.assumeIsolated {
+    let model = PresenterModel()
+    model.destination = "Conference Room A"
+    model.connection = "Design preview"
+    model.status = "Output blank"
+    model.windows = ["Keynote · Quarterly planning", "Safari · Team overview"]
+    model.isBlank = true
+    let view = PresenterView(model: model).environment(\.colorScheme, .dark)
+    writeNativePreview(view, to: CommandLine.arguments[2])
     exit(0)
 } }
 

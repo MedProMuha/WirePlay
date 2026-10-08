@@ -41,8 +41,8 @@ if [[ -d /Applications/Xcode.app ]]; then export DEVELOPER_DIR=/Applications/Xco
 
 if [[ "$MODE" == "--release" ]]; then
   echo "Compiling universal binary (arm64 + x86_64)…"
-  swiftc "${FLAGS[@]}" -target arm64-apple-macos26.0  "${FRAMEWORKS[@]}" -o build/WirePlay-arm64  Sources/main.swift
-  swiftc "${FLAGS[@]}" -target x86_64-apple-macos26.0 "${FRAMEWORKS[@]}" -o build/WirePlay-x86_64 Sources/main.swift
+  swiftc "${FLAGS[@]}" -target arm64-apple-macos26.0  "${FRAMEWORKS[@]}" -o build/WirePlay-arm64  Sources/*.swift
+  swiftc "${FLAGS[@]}" -target x86_64-apple-macos26.0 "${FRAMEWORKS[@]}" -o build/WirePlay-x86_64 Sources/*.swift
   lipo -create build/WirePlay-arm64 build/WirePlay-x86_64 -output "$APP/Contents/MacOS/WirePlay"
   rm build/WirePlay-arm64 build/WirePlay-x86_64
   ARCHS=(-arch arm64 -arch x86_64)
@@ -50,7 +50,7 @@ else
   # Build for this Mac's own architecture (arm64 on Apple silicon, x86_64 on Intel).
   LOCAL_ARCH=$(uname -m)
   echo "Compiling ($LOCAL_ARCH)…"
-  swiftc "${FLAGS[@]}" -target "$LOCAL_ARCH-apple-macos26.0" "${FRAMEWORKS[@]}" -o "$APP/Contents/MacOS/WirePlay" Sources/main.swift
+  swiftc "${FLAGS[@]}" -target "$LOCAL_ARCH-apple-macos26.0" "${FRAMEWORKS[@]}" -o "$APP/Contents/MacOS/WirePlay" Sources/*.swift
   ARCHS=(-arch "$LOCAL_ARCH")
 fi
 cp Info.plist "$APP/Contents/Info.plist"
@@ -115,21 +115,6 @@ if [[ "$MODE" == "--release" ]]; then
 fi
 
 if [[ "$MODE" == "--install" ]]; then
-  # Same place install.sh uses, so there is only ever one copy (and one Control Center button).
-  DEST="/Applications/WirePlay.app"
-  LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-  pkill -f "WirePlay.app/Contents/MacOS" 2>/dev/null || true
-  OLD="$HOME/Applications/WirePlay.app" # where earlier builds were installed
-  if [[ -d "$OLD" ]]; then
-    pluginkit -r "$OLD/Contents/PlugIns/WirePlayControls.appex" 2>/dev/null || true
-    "$LSREGISTER" -u "$OLD" 2>/dev/null || true
-    rm -rf "$OLD"
-    echo "Removed the older copy in ~/Applications."
-  fi
-  rm -rf "$DEST" && cp -R "$APP" "$DEST"
-  # Register the app and its Control Center button with macOS.
-  "$LSREGISTER" -f "$DEST"
-  pluginkit -a "$DEST/Contents/PlugIns/WirePlayControls.appex" 2>/dev/null || true
-  open "$DEST"
-  echo "Installed and launched $DEST — look for the monitor-and-plug icon in the menu bar."
+  # Source and downloaded builds use the same staged, verified replacement.
+  /bin/bash ./install.sh --local "$APP"
 fi

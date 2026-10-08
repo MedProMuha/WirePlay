@@ -1,5 +1,7 @@
 # WirePlay AirPlay beta review
 
+> Historical pre-install audit. Native fixes and current verification are described in [NATIVE_IMPLEMENTATION.md](NATIVE_IMPLEMENTATION.md).
+
 Reviewed October 7, 2026, before installation. Source: [PR #2](https://github.com/ben-medpro/WirePlay/pull/2), `airplay`, commit `0b45184dfe0cead28c211bb425effdd162a61a95`. Base: `f4b7f04e926be5fa2a4c02ba8353f34d5bfff3cd`.
 
 **Recommendation: fix the privacy lifecycle and cancellation defects before using this beta for a real presentation.** The source builds, but a successful build does not establish safe TV behavior. No actual TV connection was attempted.
